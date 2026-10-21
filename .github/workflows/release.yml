@@ -1,0 +1,165 @@
+name: Release
+
+# À chaque push sur main, une release est construite et publiée si la version
+# de src-tauri/tauri.conf.json n'a pas encore de tag (sinon le job s'arrête en
+# quelques secondes). Également déclenchable à la main : Actions → Release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version et tag existant
+        id: version
+        run: |
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::La release v$VERSION existe déjà, rien à faire."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Création de la release (brouillon)
+        id: create
+        if: steps.version.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            // Brouillons laissés par une release précédente en échec pour la même version.
+            const tag = `v${process.env.VERSION}`;
+            const existing = await github.rest.repos.listReleases({ owner: context.repo.owner, repo: context.repo.repo, per_page: 50 });
+            for (const r of existing.data.filter((r) => r.draft && r.tag_name === tag)) {
+              await github.rest.repos.deleteRelease({ owner: context.repo.owner, repo: context.repo.repo, release_id: r.id });
+              core.notice(`Brouillon ${tag} précédent supprimé (${r.id}).`);
+            }
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${process.env.VERSION}`,
+              target_commitish: context.sha,
+              name: `Ollama Desktop v${process.env.VERSION}`,
+              body: [
+                "## Téléchargements",
+                "",
+                "| Système | Fichier |",
+                "|---|---|",
+                "| macOS Apple Silicon (M1…M4) | `Ollama.Desktop_*_aarch64.dmg` |",
+                "| macOS Intel | `Ollama.Desktop_*_x64.dmg` |",
+                "| Windows | `Ollama.Desktop_*_x64-setup.exe` ou `.msi` |",
+                "| Linux Debian/Ubuntu | `.deb` |",
+                "| Linux Fedora/openSUSE | `.rpm` |",
+                "| Linux (toutes distributions) | `.AppImage` |",
+                "",
+                "Binaires non signés :",
+                "- **macOS** : `xattr -cr \"/Applications/Ollama Desktop.app\"` au premier lancement",
+                "- **Windows** : SmartScreen → « Informations complémentaires » → « Exécuter quand même »",
+              ].join("\n"),
+              draft: true,
+              prerelease: false,
+            });
+            return data.id;
+
+  build:
+    needs: create-release
+    if: needs.create-release.outputs.release_id != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libasound2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.args }}
+
+      - run: npm ci
+
+      # Mises à jour signées : uniquement si la clé privée (secret) et la clé publique (variable)
+      # sont configurées dans le dépôt. Sinon, build classique sans installation automatique.
+      - name: Signature des mises à jour
+        id: updater
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && vars.TAURI_UPDATER_PUBKEY != '' }}
+          PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: |
+          if [ "$HAS_KEY" = "true" ]; then
+            # La CLI vérifie chaque signature avec la clé publique de la configuration : on la fournit ici.
+            CONFIG=$(node -e 'process.stdout.write(JSON.stringify({bundle:{createUpdaterArtifacts:true},plugins:{updater:{pubkey:process.env.PUBKEY.trim()}}}))')
+            echo "args=--config '$CONFIG'" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Clé de signature absente : mises à jour à installer manuellement."
+          fi
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
+          updaterJsonPreferNsis: true
+
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publication de la release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+              draft: false,
+            });

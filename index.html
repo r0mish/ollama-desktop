@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ollama Desktop</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sidebar-top">
+          <div class="mode-tabs" role="tablist">
+            <button data-mode="chat" class="active" title="Conversations (Ctrl+1)">
+              <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-6.4A8 8 0 1 1 21 12z" /></svg>Chat
+            </button>
+            <button data-mode="code" title="Agent de code (Ctrl+2)">
+              <svg viewBox="0 0 24 24"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6" /></svg>Code
+            </button>
+          </div>
+          <div class="project-bar">
+            <select id="project-select" title="Projet : filtre les conversations ; les nouvelles y sont rattachées"></select>
+            <button type="button" id="project-edit" class="icon-btn sm" title="Modifier le projet" hidden>
+              <svg viewBox="0 0 24 24"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
+            </button>
+          </div>
+          <button id="new-chat" class="btn-new" title="Nouvelle conversation (Ctrl+N)">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+            <span id="new-chat-label">Nouvelle conversation</span>
+          </button>
+          <input id="search" type="search" placeholder="Rechercher…" autocomplete="off" />
+        </div>
+        <nav id="conv-list"></nav>
+        <div class="sidebar-bottom">
+          <button id="open-settings" class="btn-ghost" title="Réglages (Ctrl+,)">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
+            Réglages
+          </button>
+        </div>
+      </aside>
+
+      <main id="main">
+        <div id="update-banner" hidden></div>
+        <header id="topbar">
+          <button id="toggle-sidebar" class="icon-btn" title="Afficher/masquer la barre latérale (Ctrl+B)">
+            <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg>
+          </button>
+          <h1 id="conv-title"></h1>
+          <button id="ws-chip" class="chip-btn" title="Ouvrir le dossier du projet" hidden>
+            <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>
+            <span></span>
+          </button>
+          <button id="instr-chip" class="chip-btn instr-chip" hidden>
+            <svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><path d="M14 3v6h6M8 13h8M8 17h5" /></svg>
+            <span></span>
+          </button>
+          <button id="git-btn" class="chip-btn git-btn" title="Git (Ctrl+G)" hidden>
+            <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M6 8.5v7M18 10.5c0 4-6 3-10.5 6" /></svg>
+            <span>git</span>
+          </button>
+          <select id="perm-select" title="Permissions de l'agent" hidden>
+            <option value="ask">Tout demander</option>
+            <option value="acceptEdits">Modifs auto</option>
+            <option value="auto">Autonome</option>
+          </select>
+          <select id="conv-project" title="Projet de la conversation" hidden></select>
+          <select id="model-select" title="Modèle"></select>
+          <button id="models-btn" class="icon-btn" title="Gérer les modèles Ollama (Ctrl+M)">
+            <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /><path d="M3.3 7 12 12l8.7-5M12 22V12" /></svg>
+          </button>
+          <button id="export-btn" class="icon-btn" title="Exporter en Markdown" hidden>
+            <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14" /></svg>
+          </button>
+        </header>
+
+        <section id="messages" aria-live="polite"></section>
+
+        <footer id="composer-wrap">
+          <div id="activity" class="activity" hidden></div>
+          <div id="ws-menu" class="ws-menu" hidden></div>
+          <form id="composer">
+            <div id="attachments"></div>
+            <textarea id="input" rows="1" placeholder="Écrivez votre message…" autocomplete="off" spellcheck="true"></textarea>
+            <div class="composer-actions">
+              <button type="button" id="ws-picker" class="toggle ws-picker" title="Dossier de travail de l'agent" hidden>
+                <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>
+                <span>Choisir un dossier</span>
+                <svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+              </button>
+              <button type="button" id="attach-btn" class="icon-btn" title="Joindre une image ou un fichier texte">
+                <svg viewBox="0 0 24 24"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+              </button>
+              <input id="file-input" type="file" multiple hidden />
+              <button type="button" id="web-toggle" class="toggle" title="Recherche web">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" /></svg>Web
+              </button>
+              <button type="button" id="sys-toggle" class="toggle sys-toggle" hidden title="Accès système : autoriser l'agent à lire et modifier des fichiers en dehors du dossier de projet (ex. /etc). Chaque modification hors projet demande votre approbation.">
+                <svg viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z" /><path d="M9 12h6" /></svg><span>Système</span>
+              </button>
+              <button type="button" id="mcp-toggle" class="toggle" title="Outils MCP" hidden>
+                <svg viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0zM12 18v4" /></svg><span>MCP</span>
+              </button>
+              <span id="hint"></span>
+              <span id="dictation" hidden><span class="rec-dot"></span><span class="rec-level"><i></i></span><span id="dictation-time">0:00</span></span>
+              <span id="usage-info" hidden></span>
+              <button type="button" id="ctx-meter" class="ctx-meter" hidden></button>
+              <button type="button" id="mic-btn" class="icon-btn mic-btn" title="Dictée vocale (Ctrl+Maj+D)">
+                <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></svg>
+              </button>
+              <button type="submit" id="send-btn" class="send" title="Envoyer">
+                <svg class="i-send" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+                <svg class="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+              </button>
+            </div>
+          </form>
+          <p class="disclaimer">Les réponses peuvent contenir des erreurs. Modèles exécutés par votre serveur Ollama, conversations stockées uniquement sur cet appareil.</p>
+        </footer>
+        <div id="drop-overlay" hidden>Déposez vos fichiers ici</div>
+
+        <aside id="git-panel" hidden>
+          <header class="git-head">
+            <strong>Git</strong>
+            <select id="git-branch" title="Changer de branche"></select>
+            <input id="git-new-branch" placeholder="nom-de-branche (Entrée)" spellcheck="false" hidden />
+            <span class="spacer"></span>
+            <button type="button" class="icon-btn sm" id="git-refresh" title="Actualiser">
+              <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>
+            </button>
+            <button type="button" class="icon-btn sm" id="git-close" title="Fermer">×</button>
+          </header>
+          <div class="git-sync">
+            <button type="button" class="btn-ghost sm" data-git-sync="fetch" title="git fetch --prune">Récupérer</button>
+            <button type="button" class="btn-ghost sm" data-git-sync="pull" title="git pull --ff-only">Tirer <span id="git-behind"></span></button>
+            <button type="button" class="btn-ghost sm" data-git-sync="push" title="git push">Pousser <span id="git-ahead"></span></button>
+            <span id="git-upstream" class="muted small"></span>
+          </div>
+          <div id="git-body"></div>
+          <div id="git-diff" hidden></div>
+          <div class="git-commit">
+            <textarea id="git-message" rows="3" placeholder="Message de commit"></textarea>
+            <div class="row end">
+              <button type="button" class="btn-ghost sm" id="git-generate" title="Rédiger le message à partir du diff indexé">✨ Générer</button>
+              <button type="button" class="btn-primary sm" id="git-commit">Commit</button>
+            </div>
+          </div>
+          <details id="git-history"><summary>Historique</summary><ul id="git-log"></ul></details>
+        </aside>
+      </main>
+    </div>
+
+    <dialog id="settings">
+      <form id="settings-form" method="dialog">
+        <div class="settings-head">
+          <h2>Réglages</h2>
+          <nav class="settings-tabs">
+            <button type="button" data-tab="general" class="active">Général</button>
+            <button type="button" data-tab="tools">Outils</button>
+            <button type="button" data-tab="mcp">MCP</button>
+            <button type="button" data-tab="code">Code</button>
+            <button type="button" data-tab="usage">Utilisation</button>
+          </nav>
+        </div>
+
+        <div class="tab" data-tab="general">
+          <fieldset>
+            <legend>Serveur Ollama</legend>
+            <div class="row">
+              <input id="s-base" type="url" placeholder="http://localhost:11434" spellcheck="false" />
+              <button type="button" id="test-server" class="btn-ghost">Tester</button>
+            </div>
+            <p class="muted small" id="server-status"></p>
+            <p class="muted small">Local (<code>localhost</code>), machine du réseau privé (<code>http://192.168.1.20:11434</code>, <code>http://gpu.lan:11434</code>, Tailscale…) ou serveur distant en HTTPS. Sur une autre machine, lancez Ollama avec <code>OLLAMA_HOST=0.0.0.0</code> et filtrez le port 11434 au pare-feu.</p>
+            <details>
+              <summary class="small">Clé API (facultatif : Ollama derrière un proxy authentifiant)</summary>
+              <p class="muted small" id="key-status"></p>
+              <div class="row">
+                <input id="api-key" type="password" placeholder="Jeton envoyé en en-tête Authorization: Bearer" autocomplete="off" spellcheck="false" />
+                <button type="button" id="save-key" class="btn-primary">Enregistrer</button>
+                <button type="button" id="delete-key" class="btn-ghost danger">Supprimer</button>
+              </div>
+              <p class="muted small">Stockée dans le trousseau du système (Keychain, Credential Manager, Secret Service), jamais en clair sur le disque. Repli : variable <code>OLLAMA_API_KEY</code>.</p>
+            </details>
+          </fieldset>
+
+          <fieldset>
+            <legend>Modèle et génération</legend>
+            <div class="grid2">
+              <label>Modèle par défaut (Chat) <select id="s-model"></select></label>
+              <label><span>Fenêtre de contexte (<code>num_ctx</code>)</span>
+                <select id="s-ctx">
+                  <option value="0">Défaut du serveur</option>
+                  <option value="4096">4 k</option>
+                  <option value="8192">8 k</option>
+                  <option value="16384">16 k</option>
+                  <option value="32768">32 k</option>
+                  <option value="65536">64 k</option>
+                  <option value="131072">128 k</option>
+                </select>
+              </label>
+            </div>
+            <p class="muted small">Plus de contexte = plus de mémoire (RAM/VRAM) : 16 k convient pour le chat, 32 k ou plus pour l'agent de code. Limité automatiquement au maximum du modèle.</p>
+            <label>Instructions système (appliquées aux nouvelles conversations)
+              <textarea id="s-system" rows="3" placeholder="Ex. : Réponds en français, de façon concise."></textarea>
+            </label>
+            <div class="grid2">
+              <label>Température <input id="s-temp" type="number" min="0" max="2" step="0.1" placeholder="défaut du modèle" /></label>
+              <label>Tokens max <input id="s-max" type="number" min="1" step="1" placeholder="illimité" /></label>
+              <label><span>Maintien en mémoire (<code>keep_alive</code>)</span> <input id="s-keep" placeholder="défaut du serveur : 5m" spellcheck="false" title="Ex. 30m, 2h, -1m (toujours), 0 (libérer aussitôt)" /></label>
+            </div>
+            <label class="check"><input id="s-thinking" type="checkbox" /> Raisonnement des modèles qui le gèrent (qwen3, magistral, gpt-oss, deepseek-r1…)</label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Interface</legend>
+            <div class="grid2">
+              <label>Thème
+                <select id="s-theme">
+                  <option value="system">Système</option>
+                  <option value="light">Clair</option>
+                  <option value="dark">Sombre</option>
+                </select>
+              </label>
+              <label class="check"><input id="s-enter" type="checkbox" /> Entrée pour envoyer (Maj+Entrée = retour ligne)</label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Chiffrement des données</legend>
+            <label class="check"><input id="s-encrypt" type="checkbox" /> Chiffrer les conversations, projets et la configuration MCP sur cet appareil</label>
+            <p class="muted small" id="vault-status"></p>
+            <p class="muted small">XChaCha20-Poly1305, clé de 256 bits gardée dans le trousseau du système. Sans cette clé (réinstallation, nouvel ordinateur, trousseau réinitialisé), les données chiffrées sont illisibles : conservez la clé de récupération dans votre gestionnaire de mots de passe (KeePassXC, Bitwarden…).</p>
+            <div class="row">
+              <button type="button" id="vault-show" class="btn-ghost sm">Afficher la clé de récupération</button>
+              <button type="button" id="vault-restore" class="btn-ghost sm">Restaurer une clé…</button>
+            </div>
+            <div class="row" id="vault-key-row" hidden>
+              <input id="vault-key" spellcheck="false" autocomplete="off" class="mono" />
+              <button type="button" id="vault-key-action" class="btn-primary sm">Copier</button>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Mises à jour</legend>
+            <label class="check"><input id="s-updates" type="checkbox" /> Vérifier au démarrage si une nouvelle version est publiée sur GitHub</label>
+            <div class="row">
+              <span class="muted small" id="update-status"></span>
+              <button type="button" id="check-update" class="btn-ghost sm">Vérifier maintenant</button>
+            </div>
+            <p class="muted small">Seule requête hors de votre serveur Ollama : <code>api.github.com/repos/r0mish/ollama-desktop/releases/latest</code>, sans identifiant.</p>
+          </fieldset>
+
+          <fieldset>
+            <legend>Avancé</legend>
+            <p class="muted small">Données locales : <code id="data-dir"></code></p>
+          </fieldset>
+        </div>
+
+        <div class="tab" data-tab="tools" hidden>
+          <fieldset>
+            <legend>Recherche web</legend>
+            <label>URL de votre instance SearXNG
+              <input id="s-searx" type="url" placeholder="https://searx.example.org ou http://localhost:8888" spellcheck="false" />
+            </label>
+            <p class="muted small">Le modèle dispose alors de <code>web_search</code> (via <a href="https://docs.searxng.org" data-external>SearXNG</a>, métamoteur libre auto-hébergeable : activez le format JSON, <code>search.formats: [html, json]</code> dans settings.yml) et <code>fetch_url</code>. Les pages sont lues depuis votre machine ; les adresses du réseau local sont bloquées. Nécessite un modèle gérant les outils.</p>
+            <label class="check"><input id="s-web-default" type="checkbox" /> Activer la recherche web par défaut</label>
+          </fieldset>
+          <fieldset>
+            <legend>Dictée vocale</legend>
+            <label>Serveur de transcription
+              <input id="s-stt-url" type="url" placeholder="vide = dictée désactivée ; ex. http://localhost:8000" spellcheck="false" />
+            </label>
+            <div class="grid2">
+              <label>Modèle de transcription
+                <input id="s-stt-model" placeholder="ex. Systran/faster-whisper-small" spellcheck="false" />
+              </label>
+              <label>Langue
+                <select id="s-stt-lang">
+                  <option value="">Détection automatique</option>
+                  <option value="fr">Français</option>
+                  <option value="en">Anglais</option>
+                  <option value="de">Allemand</option>
+                  <option value="es">Espagnol</option>
+                  <option value="it">Italien</option>
+                  <option value="pt">Portugais</option>
+                  <option value="nl">Néerlandais</option>
+                </select>
+              </label>
+            </div>
+            <label>Vocabulaire à reconnaître (noms propres, termes techniques)
+              <textarea id="s-stt-vocab" rows="2" placeholder="Ex. : Proxmox, fail2ban, ZFS, Nextcloud" spellcheck="false"></textarea>
+            </label>
+            <p class="muted small">Ollama ne transcrit pas l'audio : indiquez un serveur auto-hébergé compatible <code>/v1/audio/transcriptions</code> (<a href="https://speaches.ai" data-external>Speaches</a>/faster-whisper, whisper.cpp <code>server</code>, Voxtral via vLLM…). Le son est capté en mémoire uniquement, jamais écrit sur le disque.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Documents PDF</legend>
+            <p class="muted small">Le texte des PDF est extrait localement, rien n'est envoyé ailleurs qu'à votre serveur Ollama. Pour un PDF scanné, joignez des captures des pages à un modèle vision.</p>
+          </fieldset>
+        </div>
+
+        <div class="tab" data-tab="mcp" hidden>
+          <fieldset>
+            <legend>Serveurs MCP</legend>
+            <p class="muted small">Même format que Claude Desktop. Serveurs locaux (<code>command</code>) ou distants (<code>url</code> + <code>headers</code>). Protocole MCP 2026-07-28, avec repli automatique pour les serveurs plus anciens.</p>
+            <textarea id="s-mcp" rows="10" spellcheck="false" class="mono"></textarea>
+            <div class="row end">
+              <button type="button" id="mcp-example" class="btn-ghost sm">Insérer un exemple</button>
+              <button type="button" id="mcp-apply" class="btn-primary sm">Appliquer et redémarrer</button>
+            </div>
+            <div id="mcp-status"></div>
+          </fieldset>
+          <fieldset>
+            <legend>Outils toujours autorisés</legend>
+            <div id="mcp-allowed"></div>
+          </fieldset>
+        </div>
+
+        <div class="tab" data-tab="code" hidden>
+          <fieldset>
+            <legend>Agent de code</legend>
+            <label>Modèle par défaut (Code) <select id="s-code-model"></select></label>
+            <label>Délai maximal d'une commande (secondes)
+              <input id="s-timeout" type="number" min="5" max="3600" step="5" />
+            </label>
+            <div class="grid2">
+              <label>Étapes max par tâche
+                <input id="s-max-steps" type="number" min="5" max="1000" step="5" />
+              </label>
+              <label>Compaction automatique du contexte (%)
+                <input id="s-compact" type="number" min="0" max="95" step="5" title="0 = jamais" />
+              </label>
+            </div>
+            <label id="s-shell-wrap">Shell pour les commandes (Windows)
+              <select id="s-shell">
+                <option value="auto">Automatique : Git Bash, sinon PowerShell 7, sinon PowerShell 5.1</option>
+                <option value="bash">Git Bash</option>
+                <option value="pwsh">PowerShell 7 (pwsh)</option>
+                <option value="powershell">Windows PowerShell 5.1</option>
+              </select>
+            </label>
+            <p class="muted small" id="s-shell-info"></p>
+            <label class="check"><input id="s-auto-continue" type="checkbox" /> Relancer l'agent s'il s'arrête en annonçant une action sans l'exécuter (2 fois max par tâche)</label>
+            <p class="muted small">L'agent ne peut lire et écrire que dans le dossier de projet choisi. Les commandes s'exécutent avec vos droits : en mode « Tout demander » ou « Modifs auto », chacune doit être approuvée.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Dossiers de projet autorisés</legend>
+            <div id="ws-list"></div>
+          </fieldset>
+        </div>
+
+        <div class="tab" data-tab="usage" hidden>
+          <fieldset>
+            <legend>Consommation de tokens</legend>
+            <div class="row">
+              <select id="usage-period">
+                <option value="1">Aujourd'hui</option>
+                <option value="7">7 derniers jours</option>
+                <option value="30" selected>30 derniers jours</option>
+                <option value="0">Depuis le début</option>
+              </select>
+              <span class="muted small" id="usage-total"></span>
+            </div>
+            <div id="usage-table"></div>
+            <p class="muted small">Tokens comptés par Ollama (invite et réponse). Tout s'exécute sur votre serveur : aucun coût à l'usage.</p>
+          </fieldset>
+        </div>
+
+        <p id="settings-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="settings-cancel" class="btn-ghost">Annuler</button>
+          <button type="submit" id="settings-save" class="btn-primary">Enregistrer</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="ssh-dialog">
+      <div class="ssh-layout">
+        <aside class="ssh-hosts">
+          <div class="group">Serveurs SSH</div>
+          <div id="ssh-host-list"></div>
+          <button type="button" class="btn-ghost sm" id="ssh-new">+ Nouveau serveur</button>
+        </aside>
+        <section class="ssh-main">
+          <div class="settings-head">
+            <h2 id="ssh-title">Nouveau serveur</h2>
+            <button type="button" class="icon-btn" id="ssh-close" title="Fermer">×</button>
+          </div>
+          <form id="ssh-form" autocomplete="off">
+            <div class="grid2">
+              <label>Nom affiché <input id="ssh-label" placeholder="Serveur web prod" /></label>
+              <label>Hôte <input id="ssh-host" placeholder="alias ~/.ssh/config, nom ou IP" spellcheck="false" required /></label>
+              <label>Utilisateur <input id="ssh-user" placeholder="par défaut : config SSH" spellcheck="false" /></label>
+              <label>Port <input id="ssh-port" type="number" min="1" max="65535" placeholder="22" /></label>
+            </div>
+            <label>Clé privée (facultatif) <input id="ssh-key" placeholder="~/.ssh/id_ed25519 — sinon agent SSH" spellcheck="false" /></label>
+            <p class="muted small">Utilise le client OpenSSH du système : vos alias, <code>ProxyJump</code> et clés de <code>~/.ssh/config</code> s'appliquent. Authentification par clé ou agent SSH uniquement (pas de mot de passe).</p>
+            <div class="row end">
+              <button type="button" class="btn-ghost sm danger" id="ssh-delete" hidden>Supprimer</button>
+              <button type="submit" class="btn-primary sm" id="ssh-test">Se connecter</button>
+            </div>
+          </form>
+          <div id="ssh-result"></div>
+          <div id="ssh-browser" hidden>
+            <div class="row">
+              <input id="ssh-path" spellcheck="false" />
+              <button type="button" class="btn-ghost sm" id="ssh-go">Aller</button>
+            </div>
+            <div id="ssh-dirs"></div>
+            <div class="row end">
+              <button type="button" class="btn-primary" id="ssh-open">Ouvrir ce dossier</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="project-dialog">
+      <form id="project-form" autocomplete="off">
+        <div class="settings-head">
+          <h2 id="project-title">Nouveau projet</h2>
+        </div>
+        <fieldset>
+          <label>Nom <input id="p-name" required maxlength="80" placeholder="Ex. : Thèse, Client Dupont, Homelab…" /></label>
+          <div class="p-ws-field">
+            <span class="p-ws-label">Dossier de travail (agent de code)</span>
+            <div class="p-ws">
+              <span id="p-ws-current" class="muted small">Aucun : chaque session de code choisit son dossier</span>
+              <span class="row">
+                <button type="button" class="btn-ghost sm" id="p-ws-local">Dossier local…</button>
+                <button type="button" class="btn-ghost sm" id="p-ws-ssh">Serveur SSH…</button>
+                <button type="button" class="icon-btn sm" id="p-ws-clear" title="Retirer le dossier" hidden>×</button>
+              </span>
+            </div>
+          </div>
+          <label>Consignes (ajoutées à chaque conversation du projet)
+            <textarea id="p-instructions" rows="6" placeholder="Ex. : Tu aides à rédiger la documentation de mon homelab Proxmox. Réponds en français, avec des commandes prêtes à copier."></textarea>
+          </label>
+        </fieldset>
+        <fieldset>
+          <legend>Fichiers de référence</legend>
+          <div id="p-files"></div>
+          <div class="row">
+            <button type="button" class="btn-ghost sm" id="p-add">+ Ajouter des fichiers</button>
+            <span class="muted small" id="p-size"></span>
+          </div>
+          <input id="p-file-input" type="file" multiple hidden />
+          <p class="muted small">Texte, Markdown, code, CSV ou PDF. Leur contenu accompagne chaque message envoyé dans le projet : préférez des documents ciblés. Stockés uniquement sur cet appareil.</p>
+        </fieldset>
+        <p id="project-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn-ghost danger" id="p-delete" hidden>Supprimer le projet</button>
+          <span class="spacer"></span>
+          <button type="button" class="btn-ghost" id="p-cancel">Annuler</button>
+          <button type="submit" class="btn-primary" id="p-save">Enregistrer</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="models-dialog">
+      <div class="models-wrap">
+        <div class="settings-head">
+          <h2>Modèles</h2>
+          <span id="md-server" class="muted small"></span>
+          <span class="spacer"></span>
+          <button type="button" class="icon-btn" id="md-close" title="Fermer">×</button>
+        </div>
+        <div class="group">En mémoire</div>
+        <div id="md-running"></div>
+        <div class="group">Installés</div>
+        <div id="md-installed"></div>
+        <div class="group">Télécharger un modèle</div>
+        <form id="md-pull-form" class="row" autocomplete="off">
+          <input id="md-pull-name" placeholder="nom ou nom:étiquette, ex. qwen3:8b ou hf.co/utilisateur/dépôt-GGUF:Q4_K_M" spellcheck="false" />
+          <button type="submit" id="md-pull-btn" class="btn-primary sm">Télécharger</button>
+        </form>
+        <div id="md-progress" hidden></div>
+        <div id="md-suggest"></div>
+        <p class="muted small">Catalogue complet : <a href="https://ollama.com/library" data-external>ollama.com/library</a>. Taille indicative en Q4 : ≈ 0,6 Go par milliard de paramètres, plus la mémoire du contexte. Un téléchargement interrompu reprend là où il s'est arrêté.</p>
+      </div>
+    </dialog>
+
+    <div id="toast" hidden></div>
+  </body>
+</html>
