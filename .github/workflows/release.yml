@@ -69,8 +69,8 @@ jobs:
                 "| Linux Fedora/openSUSE | `.rpm` |",
                 "| Linux (toutes distributions) | `.AppImage` |",
                 "",
-                "Binaires non signés :",
-                "- **macOS** : `xattr -cr \"/Applications/Ollama Desktop.app\"` au premier lancement",
+                "Binaires sans certificat Apple ni Microsoft :",
+                "- **macOS** : au premier lancement, Réglages Système → Confidentialité et sécurité → « Ouvrir quand même » (ou `xattr -dr com.apple.quarantine \"/Applications/Ollama Desktop.app\"`)",
                 "- **Windows** : SmartScreen → « Informations complémentaires » → « Exécuter quand même »",
               ].join("\n"),
               draft: true,
@@ -146,6 +146,17 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
           updaterJsonPreferNsis: true
+
+      # Signature ad hoc (bundle.macOS.signingIdentity = "-") : sans elle, macOS sur Apple Silicon
+      # déclare l'application « endommagée ». On refuse de publier un bundle non signé.
+      - name: Vérification de la signature (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          app=$(ls -d src-tauri/target/*/release/bundle/macos/*.app | head -1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E "^(Identifier|Format|Signature|CodeDirectory)"
+          lipo -archs "$app/Contents/MacOS/"*
 
   publish:
     needs: [create-release, build]
