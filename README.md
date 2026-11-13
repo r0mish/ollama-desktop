@@ -122,8 +122,8 @@ Téléchargez l'installateur de votre système dans les [Releases](https://githu
 
 Une release est construite et publiée automatiquement dès qu'une version encore jamais publiée (`version` dans `src-tauri/tauri.conf.json`) arrive sur `main`. Elle peut aussi être lancée à la main : Actions → Release → Run workflow.
 
-Les binaires ne sont pas signés :
-- **macOS** : `xattr -cr "/Applications/Ollama Desktop.app"` au premier lancement
+Les binaires ne sont pas signés par un certificat Apple ou Microsoft (payant) :
+- **macOS** : l'application est signée *ad hoc* (indispensable sur Apple Silicon, sinon macOS la déclare « endommagée »). Au premier lancement, macOS indique qu'il ne peut pas vérifier le développeur : Réglages Système → Confidentialité et sécurité → « Ouvrir quand même ». Ou, en ligne de commande : `xattr -dr com.apple.quarantine "/Applications/Ollama Desktop.app"`
 - **Windows** : SmartScreen → « Informations complémentaires » → « Exécuter quand même »
 
 ### Mises à jour signées (mainteneurs)
