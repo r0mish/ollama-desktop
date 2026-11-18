@@ -1,10 +1,13 @@
 // Gestion des serveurs SSH : création, test, confiance, choix d'un dossier distant.
-import { api, type SshHost } from "./api";
+import { api, type SshConfigHost, type SshHost, type SshTestResult } from "./api";
 import { escapeHtml } from "./markdown";
+import { parseTarget } from "./ssh-target";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
 let hosts: SshHost[] = [];
+/** Hôtes de ~/.ssh/config pas encore enregistrés, proposés pour un nouveau serveur. */
+let configHosts: SshConfigHost[] = [];
 let current: SshHost | null = null;
 let browsePath = "";
 let onOpen: (workspace: string) => void = () => {};
@@ -85,6 +88,104 @@ function select(h: SshHost | null) {
   $("#ssh-result").innerHTML = "";
   $("#ssh-browser").hidden = true;
   renderList();
+  renderSuggestions();
+}
+
+/** Raccourcis « depuis ~/.ssh/config » : un clic remplit le formulaire. */
+function renderSuggestions() {
+  const box = $("#ssh-suggest");
+  const free = configHosts.filter((c) => !hosts.some((h) => h.host === c.alias));
+  box.hidden = !!current || free.length === 0;
+  if (box.hidden) return;
+  box.innerHTML =
+    '<span class="muted small">Depuis <code>~/.ssh/config</code> :</span>' +
+    free
+      .slice(0, 12)
+      .map((c) => {
+        const detail = `${c.user ? `${c.user}@` : ""}${c.hostname ?? c.alias}${c.port ? `:${c.port}` : ""}`;
+        return `<button type="button" class="chip-btn" data-alias="${escapeHtml(c.alias)}" title="${escapeHtml(detail)}"><span>${escapeHtml(c.alias)}</span></button>`;
+      })
+      .join("");
+}
+
+/** `user@hôte:port` ou `ssh -p 2222 user@hôte` saisi dans « Hôte » : réparti dans les champs. */
+function splitTarget() {
+  const t = parseTarget(f.host().value);
+  if (!t) return;
+  f.host().value = t.host;
+  if (t.user) f.user().value = t.user;
+  if (t.port) f.port().value = String(t.port);
+}
+
+/** Le serveur refuse nos clés : installation d'une clé par mot de passe, ou à la main. */
+function showAuthHelp(host: SshHost, res: SshTestResult) {
+  const methods = res.authMethods;
+  const passwordOk = !methods.length || methods.some((m) => m === "password" || m === "keyboard-interactive");
+  const account = host.user ? `<strong>${escapeHtml(host.user)}</strong>` : "votre compte";
+  showResult(
+    `<strong>Le serveur n'accepte encore aucune de vos clés.</strong>
+     ${
+       passwordOk
+         ? `<p>Saisissez le mot de passe de ${account} sur ce serveur : une clé dédiée à Ollama Desktop y sera installée, et les connexions suivantes se feront sans mot de passe.</p>
+            <div class="row"><input id="ssh-password" type="password" placeholder="Mot de passe du serveur" autocomplete="off" />
+              <button type="button" class="btn-primary sm" id="ssh-install">Installer la clé</button></div>
+            <p class="muted small">Le mot de passe sert une seule fois et n'est jamais enregistré. Clé créée dans <code>~/.ssh/ollama-desktop_ed25519</code>, ajoutée à <code>~/.ssh/authorized_keys</code> du serveur.</p>`
+         : `<p>Ce serveur n'autorise pas la connexion par mot de passe (méthodes : ${escapeHtml(methods.join(", "))}). Ajoutez la clé publique ci-dessous sur le serveur, puis reconnectez-vous.</p>`
+     }
+     <details${passwordOk ? "" : " open"} id="ssh-manual"><summary>Ajouter la clé à la main</summary>
+       <p class="muted small">Collez cette ligne dans <code>~/.ssh/authorized_keys</code> du serveur (ou dans la console de votre hébergeur), indiquez <code>~/.ssh/ollama-desktop_ed25519</code> comme clé privée ci-dessus, puis reconnectez-vous.</p>
+       <div class="row"><input id="ssh-pubkey" readonly spellcheck="false" class="mono" placeholder="Création de la clé…" />
+         <button type="button" class="btn-ghost sm" id="ssh-copy-key">Copier</button></div>
+     </details>`,
+    "warn",
+  );
+  const pubkey = $<HTMLInputElement>("#ssh-pubkey");
+  const loadKey = () => {
+    if (!pubkey.value) api.sshPublicKey().then((k) => (pubkey.value = k)).catch((e) => (pubkey.placeholder = errMsg(e)));
+  };
+  if (!passwordOk) loadKey();
+  $("#ssh-manual").addEventListener("toggle", loadKey);
+  $("#ssh-copy-key").addEventListener("click", async () => {
+    if (!pubkey.value) return;
+    await navigator.clipboard.writeText(pubkey.value);
+    if (!f.key().value.trim()) f.key().value = "~/.ssh/ollama-desktop_ed25519";
+    notify("Clé publique copiée");
+  });
+  if (!passwordOk) return;
+  const input = $<HTMLInputElement>("#ssh-password");
+  const btn = $<HTMLButtonElement>("#ssh-install");
+  const install = async () => {
+    const password = input.value;
+    if (!password || btn.disabled) return;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Installation…';
+    try {
+      const done = await api.sshInstallKey(host, password);
+      input.value = "";
+      f.key().value = done.identityFile;
+      notify(done.already ? "Clé déjà autorisée sur le serveur" : "Clé installée sur le serveur");
+      await connect();
+    } catch (e) {
+      input.value = "";
+      btn.disabled = false;
+      btn.textContent = "Installer la clé";
+      let err = $("#ssh-install-error");
+      if (!err) {
+        btn.closest(".row")!.insertAdjacentHTML("afterend", '<p class="error small" id="ssh-install-error"></p>');
+        err = $("#ssh-install-error");
+      }
+      err.textContent = errMsg(e);
+      input.focus();
+    }
+  };
+  btn.addEventListener("click", install);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      install();
+    }
+  });
+  input.focus();
 }
 
 function showResult(html: string, kind: "ok" | "error" | "warn" | "info") {
@@ -92,6 +193,7 @@ function showResult(html: string, kind: "ok" | "error" | "warn" | "info") {
 }
 
 async function connect() {
+  splitTarget();
   const host = formHost();
   if (!host.host) return;
   showResult('<span class="spinner"></span> Connexion…', "info");
@@ -117,12 +219,14 @@ async function connect() {
       });
       return;
     }
+    if (res.authFailed) return showAuthHelp(host, res);
     if (!res.ok) return showResult(escapeHtml(res.error ?? "Échec de la connexion"), "error");
     // Connexion réussie : on enregistre le serveur (avec le système détecté).
     const saved = await api.sshSaveHost({ ...host, system: res.system });
     current = saved;
     await loadHosts();
     renderList();
+    renderSuggestions();
     $("#ssh-title").textContent = saved.label;
     $("#ssh-delete").hidden = false;
     showResult(
@@ -161,6 +265,13 @@ export function openSshDialog(pick?: (workspace: string) => void) {
   $("#ssh-open").textContent = pick ? "Choisir ce dossier" : "Ouvrir ce dossier";
   select(hosts[0] ?? null);
   dlg().showModal();
+  api
+    .sshConfigHosts()
+    .then((c) => {
+      configHosts = c;
+      renderSuggestions();
+    })
+    .catch(() => {});
 }
 
 export function initSshUi(opts: { onOpen: (ws: string) => void; toast: (msg: string, error?: boolean) => void }) {
@@ -176,6 +287,15 @@ export function initSshUi(opts: { onOpen: (ws: string) => void; toast: (msg: str
       browsePath = "";
       select(h);
     }
+  });
+  f.host().addEventListener("change", splitTarget);
+  $("#ssh-suggest").addEventListener("click", (e) => {
+    const alias = (e.target as HTMLElement).closest<HTMLElement>("[data-alias]")?.dataset.alias;
+    if (!alias) return;
+    // Port, utilisateur et clé viennent de ~/.ssh/config : seul l'alias est enregistré.
+    f.host().value = alias;
+    if (!f.label().value.trim()) f.label().value = alias;
+    connect();
   });
   $("#ssh-form").addEventListener("submit", (e) => {
     e.preventDefault();

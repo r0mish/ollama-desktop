@@ -384,15 +384,16 @@
             <h2 id="ssh-title">Nouveau serveur</h2>
             <button type="button" class="icon-btn" id="ssh-close" title="Fermer">×</button>
           </div>
+          <div id="ssh-suggest" hidden></div>
           <form id="ssh-form" autocomplete="off">
             <div class="grid2">
               <label>Nom affiché <input id="ssh-label" placeholder="Serveur web prod" /></label>
-              <label>Hôte <input id="ssh-host" placeholder="alias ~/.ssh/config, nom ou IP" spellcheck="false" required /></label>
+              <label>Hôte <input id="ssh-host" placeholder="nom, IP, alias, ou user@hôte:port" spellcheck="false" required /></label>
               <label>Utilisateur <input id="ssh-user" placeholder="par défaut : config SSH" spellcheck="false" /></label>
               <label>Port <input id="ssh-port" type="number" min="1" max="65535" placeholder="22" /></label>
             </div>
             <label>Clé privée (facultatif) <input id="ssh-key" placeholder="~/.ssh/id_ed25519 — sinon agent SSH" spellcheck="false" /></label>
-            <p class="muted small">Utilise le client OpenSSH du système : vos alias, <code>ProxyJump</code> et clés de <code>~/.ssh/config</code> s'appliquent. Authentification par clé ou agent SSH uniquement (pas de mot de passe).</p>
+            <p class="muted small">Utilise le client OpenSSH du système : vos alias, <code>ProxyJump</code> et clés de <code>~/.ssh/config</code> s'appliquent. Pas encore de clé sur le serveur ? Cliquez sur « Se connecter » : l'application propose de l'installer avec votre mot de passe, demandé une seule fois et jamais enregistré.</p>
             <div class="row end">
               <button type="button" class="btn-ghost sm danger" id="ssh-delete" hidden>Supprimer</button>
               <button type="submit" class="btn-primary sm" id="ssh-test">Se connecter</button>

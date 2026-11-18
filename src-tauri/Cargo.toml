@@ -1,6 +1,6 @@
 [package]
 name = "ollama-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Client de bureau léger et respectueux de la vie privée pour Ollama"
 authors = ["r0mish"]
 license = "MIT"

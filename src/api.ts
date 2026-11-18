@@ -273,10 +273,21 @@ export interface SshTestResult {
   error: string | null;
   needsTrust: boolean;
   fingerprints: string[];
+  /** Aucune clé acceptée par le serveur. */
+  authFailed: boolean;
+  /** Méthodes acceptées par le serveur, si connues. */
+  authMethods: string[];
   system: string | null;
   user: string | null;
   home: string | null;
   git: string | null;
+}
+
+export interface SshConfigHost {
+  alias: string;
+  hostname: string | null;
+  user: string | null;
+  port: number | null;
 }
 
 export interface GitFile {
@@ -341,6 +352,10 @@ export const api = {
   sshDeleteHost: (id: string) => invoke<void>("ssh_delete_host", { id }),
   sshTest: (host: SshHost) => invoke<SshTestResult>("ssh_test", { host }),
   sshTrust: (host: SshHost) => invoke<void>("ssh_trust", { host }),
+  sshInstallKey: (host: SshHost, password: string) =>
+    invoke<{ identityFile: string; already: boolean }>("ssh_install_key", { host, password }),
+  sshPublicKey: () => invoke<string>("ssh_public_key"),
+  sshConfigHosts: () => invoke<SshConfigHost[]>("ssh_config_hosts"),
   sshListDirs: (hostId: string, path: string) => invoke<{ path: string; dirs: string[] }>("ssh_list_dirs", { hostId, path }),
   sshOpenWorkspace: (hostId: string, path: string) => invoke<string>("ssh_open_workspace", { hostId, path }),
 

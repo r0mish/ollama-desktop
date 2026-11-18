@@ -503,6 +503,22 @@ async fn ssh_trust(host: ssh::SshHost) -> CmdResult<()> {
     ssh::trust(&host).await
 }
 
+/// Installe la clé de l'application sur le serveur ; le mot de passe ne sert qu'à cet appel.
+#[tauri::command]
+async fn ssh_install_key(host: ssh::SshHost, password: String) -> CmdResult<ssh::KeySetup> {
+    ssh::install_key(&host, &password).await
+}
+
+#[tauri::command]
+async fn ssh_public_key() -> CmdResult<String> {
+    ssh::public_key().await
+}
+
+#[tauri::command]
+fn ssh_config_hosts() -> Vec<ssh::ConfigHost> {
+    ssh::config_hosts()
+}
+
 fn find_host(app: &AppHandle, id: &str) -> CmdResult<ssh::SshHost> {
     storage::load_ssh_hosts(app).into_iter().find(|h| h.id == id).ok_or_else(|| "Serveur SSH inconnu".to_string())
 }
@@ -719,6 +735,11 @@ async fn install_update(app: AppHandle, on_progress: Channel<serde_json::Value>)
     app.restart()
 }
 
+/// Mode « askpass » (voir `ssh::askpass_main`) : code de sortie, ou None lors d'un lancement normal.
+pub fn askpass() -> Option<i32> {
+    ssh::askpass_main()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(unix)]
@@ -803,6 +824,9 @@ pub fn run() {
             ssh_delete_host,
             ssh_test,
             ssh_trust,
+            ssh_install_key,
+            ssh_public_key,
+            ssh_config_hosts,
             ssh_list_dirs,
             ssh_open_workspace,
             git_status,

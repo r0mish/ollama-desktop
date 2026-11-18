@@ -45,9 +45,21 @@ Un agent façon Claude Code, avec un modèle local gérant les outils (`devstral
 - **Diff coloré** avant chaque modification, approbation commande par commande ; trois niveaux : **Tout demander**, **Modifs auto**, **Autonome**
 - Accès **confiné au dossier choisi** ; **accès système** optionnel (fichiers hors projet, ex. `/etc/fail2ban/jail.local`) avec approbation systématique
 - **Fichiers de consignes** lus automatiquement : `AGENTS.md`, `OLLAMA.md` ou `CLAUDE.md` ; génération d'`AGENTS.md` par l'agent
-- **Serveurs SSH** : l'agent travaille directement sur un serveur via le client OpenSSH du système (alias, `ProxyJump`, clés de `~/.ssh/config`, ControlMaster), vérification des empreintes d'hôte
+- **Serveurs SSH** : l'agent travaille directement sur un serveur via le client OpenSSH du système (alias, `ProxyJump`, clés de `~/.ssh/config`, ControlMaster), vérification des empreintes d'hôte. Détail ci-dessous
 - **Git** (`Ctrl/⌘+G`) : branches, indexation, diff, commit avec **message généré** par le modèle, fetch/pull/push
 - Le modèle choisi doit gérer les appels d'outils : l'application le vérifie avant de lancer l'agent
+
+### Serveurs SSH
+
+![SSH](docs/screenshot-ssh.png)
+
+- **Ajout rapide** : les hôtes de `~/.ssh/config` sont proposés en un clic ; le champ « Hôte » accepte aussi `user@hôte:port`, `ssh://…` ou une commande collée (`ssh -p 2222 root@10.0.0.5`)
+- **Hôte inconnu** : les empreintes SHA256 sont affichées avant toute confiance, puis ajoutées à `~/.ssh/known_hosts`
+- **Installation d'une clé par mot de passe** : si le serveur n'accepte encore aucune de vos clés, saisissez son mot de passe une fois. Une clé dédiée (`~/.ssh/ollama-desktop_ed25519`, ed25519) est créée et ajoutée à `~/.ssh/authorized_keys` du serveur, sans doublon ; les connexions suivantes se font par clé
+  - le mot de passe n'est **jamais enregistré** : il est transmis à `ssh` par le mécanisme `SSH_ASKPASS`, ni en argument ni dans un fichier, et seulement à un hôte dont l'empreinte est déjà validée
+  - une seule tentative par saisie (pas de verrouillage de compte ni de bannissement fail2ban)
+- **Serveur sans mot de passe** (`PasswordAuthentication no`) : l'application le détecte et affiche la clé publique à copier dans `authorized_keys` ou la console de l'hébergeur
+- Pour révoquer l'accès : retirez la ligne `… ollama-desktop` de `~/.ssh/authorized_keys` sur le serveur
 
 ### Recherche web
 Bascule **Web** dans la zone de saisie : `web_search` via votre instance **[SearXNG](https://docs.searxng.org)** (métamoteur libre, auto-hébergeable) et `fetch_url`. Les adresses du réseau local sont **bloquées** pour `fetch_url` (protection contre le sondage du LAN par une page piégée).

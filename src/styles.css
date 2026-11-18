@@ -775,3 +775,11 @@ table.usage th { color: var(--muted); font-weight: 500; }
 .md-suggestion:disabled { opacity: 0.55; cursor: default; }
 .md-suggestion small { font-size: 12px; }
 .welcome .row .btn-primary { margin-top: 0; }
+
+/* ---------------------------------------------------------------- SSH : suggestions et installation de clé */
+#ssh-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ssh-msg p { margin: 8px 0; }
+.ssh-msg .row input { flex: 1; min-width: 0; }
+.ssh-msg details { margin-top: 8px; }
+.ssh-msg summary { cursor: pointer; font-size: 13px; }
+.ssh-msg.warn { color: var(--text); }
