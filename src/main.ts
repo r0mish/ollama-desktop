@@ -1,9 +1,12 @@
 import "highlight.js/styles/github-dark.css";
 import "./styles.css";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
   type ApiMessage,
+  type Assistant,
+  type ConvParams,
   type Conversation,
   type ConversationSummary,
   type InstructionFile,
@@ -15,6 +18,8 @@ import {
   type ProjectContext,
   type Project,
   type Risk,
+  type RunningModel,
+  type Server,
   type ServerStatus,
   type Settings,
   type TextFile,
@@ -22,7 +27,7 @@ import {
   type ToolContext,
   type UpdateInfo,
 } from "./api";
-import { COMPACT_PROMPT, INIT_AGENTS_PROMPT, looksUnfinished, needsApproval, systemPrompt, toApiMessages, toolCardHtml, toolLabel } from "./agent";
+import { COMPACT_PROMPT, INIT_AGENTS_PROMPT, diffHtml, looksUnfinished, needsApproval, systemPrompt, toApiMessages, toolCardHtml, toolLabel, usesSudo } from "./agent";
 import { aggregate, contextTokens, conversationUsage, fmtDuration, fmtSpeed, fmtTokens, today } from "./usage";
 import { escapeHtml, renderMarkdown } from "./markdown";
 import { initSshUi, loadHosts, openSshDialog, parseRemote, workspaceLabel } from "./ssh-ui";
@@ -30,6 +35,14 @@ import { initGitUi, scheduleGitRefresh, toggleGitPanel } from "./git-ui";
 import { findProject, initProjectsUi, loadProjects, openProjectDialog, projectChars, projectList } from "./projects-ui";
 import { cancelDictation, initDictation, toggleDictation } from "./dictation";
 import { initModelsUi, openModelsDialog } from "./models-ui";
+import { initBackupUi, renderBackup } from "./backup-ui";
+import { initPopover } from "./popover";
+import { closePreview, initPreview, openPreview, type PreviewKind } from "./preview";
+import { commitServerForm, initServersUi, renderServerChip, renderServers, serversDraft } from "./servers-ui";
+import { initModelPicker, openModelMenu, renderModelButton } from "./model-picker";
+import { assistants, initAssistantsUi, loadAssistants, openAssistantsDialog } from "./assistants-ui";
+import { initConvSettings, isCustomized } from "./conv-settings";
+import { initPalette, matches, openPalette, type PaletteItem } from "./palette";
 import type { Platform } from "./agent";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -42,7 +55,8 @@ const el = {
   title: $("#conv-title"),
   wsChip: $<HTMLButtonElement>("#ws-chip"),
   permSelect: $<HTMLSelectElement>("#perm-select"),
-  modelSelect: $<HTMLSelectElement>("#model-select"),
+  modelBtn: $<HTMLButtonElement>("#model-btn"),
+  convSettingsBtn: $<HTMLButtonElement>("#conv-settings-btn"),
   exportBtn: $<HTMLButtonElement>("#export-btn"),
   messages: $("#messages"),
   composer: $<HTMLFormElement>("#composer"),
@@ -62,6 +76,8 @@ const el = {
   usageInfo: $("#usage-info"),
   updateBanner: $("#update-banner"),
   gitBtn: $<HTMLButtonElement>("#git-btn"),
+  changesBtn: $<HTMLButtonElement>("#changes-btn"),
+  changesPanel: $("#changes-panel"),
   wsPicker: $<HTMLButtonElement>("#ws-picker"),
   wsMenu: $("#ws-menu"),
   instrChip: $<HTMLButtonElement>("#instr-chip"),
@@ -90,9 +106,27 @@ interface Activity {
   maxSteps: number;
 }
 
+/** Exécution en cours d'une conversation. */
+interface Run {
+  conv: Conversation;
+  requestId: string;
+  msgId: string;
+  stopped: boolean;
+  activity: Activity;
+  /** Appels d'outils en attente d'une décision de l'utilisateur (et mot de passe sudo saisi). */
+  approvals: Map<string, (d: Decision, sudo?: SudoInput) => void>;
+}
+
+type Decision = "allow" | "always" | "deny";
+interface SudoInput {
+  password: string;
+  keep: boolean;
+}
+
 /** Bilan du dernier tour de l'agent, affiché tant que rien d'autre ne se passe. */
 interface RunOutcome {
-  convId: string;
+  /** Mode plan : le plan proposé peut être exécuté d'un clic. */
+  plan?: boolean;
   kind: "done" | "stopped" | "error" | "limit" | "denied" | "truncated";
   text: string;
   canContinue: boolean;
@@ -106,6 +140,11 @@ interface Draft {
   permissionMode: PermissionMode;
   systemAccess?: boolean;
   projectId?: string;
+  /** Consignes et réglages choisis avant le premier envoi (absent = réglages globaux). */
+  systemPrompt?: string | null;
+  params?: ConvParams;
+  /** Nom de l'assistant appliqué. */
+  assistant?: string;
 }
 
 const state = {
@@ -113,10 +152,14 @@ const state = {
   platform: { os: "linux", shell: "sh", shellPath: "", shellGuidance: "", version: "" },
   /** Serveur Ollama : version (connecté) ou erreur. */
   server: null as ServerStatus | null,
+  /** Modèles de chat installés sur le serveur. */
   models: [] as ModelInfo[],
+  /** Tous les modèles installés, modèles d'embedding compris (gestionnaire de modèles). */
+  allModels: [] as ModelInfo[],
   modelsLoaded: false,
   /** Modèles chargés en mémoire par Ollama (réponse immédiate). */
   loaded: [] as string[],
+  running: [] as RunningModel[],
   /** Dernier modèle choisi à la main, par mode : repris par les nouvelles conversations. */
   lastModel: {} as Partial<Record<Kind, string>>,
   convs: [] as ConversationSummary[],
@@ -125,14 +168,15 @@ const state = {
   mode: "chat" as Kind,
   current: null as Conversation | null,
   draft: { webSearch: false, mcp: true, permissionMode: "ask" } as Draft,
-  /** Exécution en cours (génération ou outil). */
-  busy: null as { requestId: string; msgId: string; stopped: boolean } | null,
+  /** Exécutions en cours (génération ou outil), par conversation : plusieurs peuvent tourner à la fois. */
+  runs: new Map<string, Run>(),
+  /** Conversations dont l'exécution s'est terminée en arrière-plan (pastille dans la barre latérale). */
+  unread: new Set<string>(),
   pending: { images: [] as string[], files: [] as TextFile[] },
   selectedModel: "",
   risks: new Map<string, Risk>(),
-  approvals: new Map<string, (d: "allow" | "always" | "deny") => void>(),
-  activity: null as Activity | null,
-  lastRun: null as RunOutcome | null,
+  /** Bilan de la dernière exécution, par conversation. */
+  lastRuns: new Map<string, RunOutcome>(),
   update: null as UpdateInfo | null,
   /** Projet affiché dans la barre latérale ("" = toutes les conversations). */
   projectFilter: "",
@@ -145,6 +189,18 @@ const state = {
 };
 
 const uid = () => crypto.randomUUID();
+
+/** Exécution en cours de la conversation affichée. */
+const currentRun = () => (state.current ? state.runs.get(state.current.id) : undefined);
+/** La conversation est-elle celle affichée ? (une exécution continue en arrière-plan sinon) */
+const viewing = (conv: Conversation) => state.current === conv;
+/** Mots de passe sudo retenus pour la session (en mémoire uniquement), par machine cible. */
+const sudoCache = new Map<string, string>();
+/** Machine sur laquelle s'exécutent les commandes d'une conversation : serveur SSH ou cet ordinateur. */
+const sudoTarget = (conv: Conversation) => parseRemote(conv.workspace)?.hostId ?? "local";
+let embedWarned = false;
+/** Conversations supprimées pendant leur exécution : plus aucune sauvegarde. */
+const deletedConvs = new Set<string>();
 
 /** Plateforme vue par l'agent : la machine locale, ou le serveur SSH du dossier de projet. */
 function platformFor(conv: Conversation): Platform {
@@ -192,9 +248,11 @@ function toast(msg: string, isError = false) {
 
 const errMsg = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e));
 
-function applyTheme(theme: Settings["theme"]) {
+function applyTheme(theme: Settings["theme"], accent: Settings["accent"] = state.settings.accent) {
   if (theme === "system") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.dataset.theme = theme;
+  if (!accent || accent === "teal") document.documentElement.removeAttribute("data-accent");
+  else document.documentElement.dataset.accent = accent;
 }
 
 async function copy(text: string, btn?: HTMLElement) {
@@ -212,6 +270,7 @@ const icons = {
   edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>',
+  compare: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="7.5" height="16" rx="2"/><rect x="13.5" y="4" width="7.5" height="16" rx="2"/></svg>',
   folder: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
   server: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>',
 };
@@ -241,20 +300,49 @@ function fillModelSelect(select: HTMLSelectElement, value: string, auto?: string
 }
 
 async function loadModels() {
-  state.server = await api.serverStatus().catch((e) => ({ url: state.settings.baseUrl, version: null, error: errMsg(e), insecure: false }));
+  const srv = state.settings.servers.find((v) => v.id === state.settings.activeServer) ?? state.settings.servers[0];
+  state.server = await api
+    .serverStatus()
+    .catch((e) => ({ id: srv?.id ?? "", name: srv?.name ?? "Ollama", url: srv?.url ?? "", tunnel: null, version: null, error: errMsg(e), insecure: false }));
   if (connected()) {
     try {
-      state.models = await api.listModels();
+      state.allModels = await api.listModels();
+      state.models = state.allModels.filter((m) => m.completion);
       state.modelsLoaded = true;
-      state.loaded = (await api.runningModels().catch(() => [])).map((r) => r.name);
     } catch (e) {
       toast(`Liste des modèles indisponible : ${errMsg(e)}`, true);
     }
+    await refreshRunning();
+  } else {
+    state.running = [];
+    state.loaded = [];
   }
+  renderServerChip();
   if (!state.current && (!state.selectedModel || !modelInfo(state.selectedModel))) state.selectedModel = defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
+  renderModelButton();
   if (!state.current) renderWelcome();
   renderChrome();
+}
+
+/** Modèles chargés en mémoire sur le serveur (indicateur de la barre latérale). */
+async function refreshRunning() {
+  if (!connected()) return;
+  state.running = await api.runningModels().catch(() => state.running);
+  state.loaded = state.running.map((r) => r.name);
+  renderServerChip();
+}
+
+/** Change de serveur Ollama (ou de liste de serveurs) puis recharge son état et ses modèles. */
+async function applyServers(servers: Server[], activeServer: string) {
+  const next = { ...state.settings, servers, activeServer };
+  await api.saveSettings(next);
+  state.settings = next;
+  state.server = null;
+  state.models = state.allModels = [];
+  state.modelsLoaded = false;
+  renderServerChip();
+  if (!state.current) renderWelcome();
+  await loadModels();
 }
 
 const modelInfo = (id: string) => state.models.find((m) => m.id === id);
@@ -281,27 +369,48 @@ function defaultModelFor(kind: Kind): string {
   return (loaded ?? hinted ?? pool[0])?.id ?? wanted;
 }
 
+/** Applique un assistant (modèle, consignes, réglages) à la conversation affichée ou au brouillon. */
+function useAssistant(a: Assistant) {
+  // Un second clic sur l'assistant déjà choisi (avant le premier envoi) le retire.
+  const off = !state.current && state.draft.assistant === a.name;
+  const patch = off
+    ? { assistant: undefined, systemPrompt: undefined, params: undefined }
+    : { assistant: a.name, systemPrompt: a.systemPrompt || undefined, params: a.params };
+  if (state.current) {
+    Object.assign(state.current, { ...patch, systemPrompt: patch.systemPrompt ?? null });
+    saveCurrent();
+  } else {
+    Object.assign(state.draft, patch);
+  }
+  if (!off && a.model) {
+    if (modelInfo(a.model)) state.selectedModel = a.model;
+    else toast(`Le modèle ${a.model} de cet assistant n'est pas installé sur ce serveur : modèle actuel conservé.`, true);
+  }
+  renderChrome();
+  if (!state.current) renderWelcome();
+  el.input.focus();
+}
+
 /** Choix explicite d'un modèle par l'utilisateur. */
 function pickModel(model: string) {
   state.selectedModel = model;
   state.lastModel[opts().kind] = model;
-  fillModelSelect(el.modelSelect, model);
-  renderUsage();
+  renderChrome();
 }
 
-/** Fenêtre de contexte effective : réglage num_ctx, limité au maximum du modèle. */
-function contextFor(model: string): number | null {
+/** Fenêtre de contexte effective : réglage de la conversation ou global, limité au maximum du modèle. */
+function contextFor(model: string, conv?: { params?: ConvParams } | null): number | null {
   const max = modelInfo(model)?.maxContextLength ?? null;
-  const n = state.settings.numCtx;
+  const n = conv?.params?.numCtx ?? state.settings.numCtx;
   if (!n) return null;
   return max ? Math.min(n, max) : n;
 }
 
 /** Options Ollama d'une requête : contexte et raisonnement (seulement si le modèle le gère). */
-function chatOptions(model: string, think?: boolean) {
+function chatOptions(conv: { model: string; params?: ConvParams }, think?: boolean) {
   return {
-    numCtx: contextFor(model),
-    think: modelInfo(model)?.thinking ? (think ?? state.settings.thinking) : null,
+    numCtx: contextFor(conv.model, conv),
+    think: modelInfo(conv.model)?.thinking ? (think ?? conv.params?.think ?? state.settings.thinking) : null,
   };
 }
 
@@ -320,7 +429,13 @@ function dayBucket(ts: number): string {
 }
 
 function renderSidebar() {
-  document.querySelectorAll<HTMLElement>(".mode-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.mode === state.mode));
+  document.querySelectorAll<HTMLElement>(".mode-tabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mode === state.mode);
+    // Pastille sur l'onglet : exécutions en cours, en attente d'approbation ou terminées dans ce mode.
+    const runs = [...state.runs.values()].filter((r) => r.conv.kind === b.dataset.mode);
+    const unread = state.convs.some((c) => c.kind === b.dataset.mode && state.unread.has(c.id));
+    b.dataset.status = runs.some((r) => r.approvals.size) ? "waiting" : runs.length ? "running" : unread ? "unread" : "";
+  });
   el.newChatLabel.textContent = state.mode === "code" ? "Nouvelle session de code" : "Nouvelle conversation";
   renderProjectBar();
   const q = el.search.value.trim().toLowerCase();
@@ -337,7 +452,10 @@ function renderSidebar() {
       html += `<div class="group">${escapeHtml(b)}</div>`;
       bucket = b;
     }
-    const active = (c.id === state.current?.id ? " active" : "") + (state.busy && c.id === state.current?.id ? " running" : "");
+    const run = state.runs.get(c.id);
+    const active =
+      (c.id === state.current?.id ? " active" : "") +
+      (run ? (run.approvals.size ? " waiting" : " running") : state.unread.has(c.id) ? " unread" : "");
     const subParts = [
       c.workspace ? workspaceLabel(c.workspace).name : "",
       !pf && c.projectId ? (findProject(c.projectId)?.name ?? "") : "",
@@ -379,7 +497,7 @@ el.projectSelect.addEventListener("change", () => {
     return newProject();
   }
   state.projectFilter = v;
-  if (state.current && !state.busy && (state.current.projectId ?? "") !== v) return newChat();
+  if (state.current && (state.current.projectId ?? "") !== v) return newChat();
   if (!state.current) {
     state.draft.projectId = v || undefined;
     if (state.mode === "code") state.draft.workspace = projectWorkspace(v) ?? state.draft.workspace;
@@ -477,7 +595,11 @@ el.convList.addEventListener("click", async (ev) => {
       setTimeout(() => btn.classList.remove("confirm"), 3000);
       return;
     }
-    if (state.busy && state.current?.id === id) await stop();
+    deletedConvs.add(id);
+    const run = state.runs.get(id);
+    if (run) await stopRun(run);
+    state.unread.delete(id);
+    state.lastRuns.delete(id);
     await api.deleteConversation(id);
     if (state.current?.id === id) newChat();
     await refreshConvs();
@@ -517,20 +639,17 @@ el.convList.addEventListener("click", async (ev) => {
 });
 
 async function openConversation(id: string) {
-  if (state.busy) {
-    toast("Arrêtez la génération en cours avant de changer de conversation.", true);
-    return;
-  }
   try {
-    state.current = await api.loadConversation(id);
+    // Conversation en cours d'exécution : on reprend l'objet vivant, pas la copie du disque.
+    state.current = state.runs.get(id)?.conv ?? (await api.loadConversation(id));
   } catch (e) {
     toast(errMsg(e), true);
     return;
   }
+  state.unread.delete(id);
   state.current.kind ??= "chat";
   state.mode = state.current.kind;
   state.selectedModel = state.current.model || defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
   if (state.current.workspace) api.touchWorkspace(state.current.workspace).catch(() => {});
   renderSidebar();
   renderConversation();
@@ -544,10 +663,6 @@ const projectWorkspace = (id?: string | null) => {
 };
 
 function newChat() {
-  if (state.busy) {
-    toast("Arrêtez la génération en cours d'abord.", true);
-    return;
-  }
   state.current = null;
   state.draft = {
     // Pas de dossier repris en silence : on le choisit explicitement (sauf projet avec dossier).
@@ -558,7 +673,6 @@ function newChat() {
     projectId: state.projectFilter || undefined,
   };
   state.selectedModel = defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
   renderSidebar();
   renderConversation();
   el.input.focus();
@@ -577,6 +691,9 @@ const opts = () => {
     systemAccess: !!(c ? c.systemAccess : state.draft.systemAccess),
     permissionMode: (c ? c.permissionMode : state.draft.permissionMode) ?? "ask",
     projectId: c ? c.projectId : state.draft.projectId,
+    systemPrompt: c ? c.systemPrompt : state.draft.systemPrompt,
+    params: c ? c.params : state.draft.params,
+    assistant: c ? c.assistant : state.draft.assistant,
   };
 };
 
@@ -614,9 +731,12 @@ function renderChrome() {
     el.convProject.value = o.projectId && findProject(o.projectId) ? o.projectId : "";
     el.convProject.classList.toggle("on", !!el.convProject.value);
   }
+  renderChanges();
   if (o.kind !== "code" || !o.workspace) toggleGitPanel(false);
   if (o.kind === "code") scheduleGitRefresh(200);
   else el.gitBtn.hidden = true;
+  renderModelButton();
+  el.convSettingsBtn.classList.toggle("on", isCustomized(o.systemPrompt, o.params, state.settings));
   el.permSelect.hidden = o.kind !== "code";
   el.permSelect.value = o.permissionMode;
   el.webToggle.classList.toggle("on", o.webSearch);
@@ -787,29 +907,73 @@ async function chooseWorkspace() {
 
 // ---------------------------------------------------------------- messages
 
+/** Modèles proposés pour un premier téléchargement. */
+const STARTER_MODELS = [
+  { id: "ministral-3:8b", title: "Polyvalent", desc: "Mistral AI · chat, images, outils · ≈ 6 Go" },
+  { id: "qwen3:8b", title: "Raisonnement", desc: "Alibaba · réfléchit avant de répondre · ≈ 5 Go" },
+  { id: "devstral-small-2", title: "Agent de code", desc: "Mistral AI · pour l'onglet Code · ≈ 15 Go" },
+];
+
+/** Étapes de l'accueil guidé : serveur, premier modèle, prise en main. */
+function onboardingHtml(step: 1 | 2 | 3, body: string): string {
+  const steps = ["Serveur Ollama", "Premier modèle", "C'est parti"];
+  const head = steps
+    .map((label, i) => `<li class="${i + 1 < step ? "done" : i + 1 === step ? "current" : ""}"><span>${i + 1 < step ? "✓" : i + 1}</span>${label}</li>`)
+    .join("");
+  return `<div class="welcome setup"><ol class="stepper">${head}</ol>${body}</div>`;
+}
+
 function renderWelcome() {
   if (!state.server) {
     el.messages.innerHTML = `<div class="welcome"><p class="muted">Connexion à Ollama…</p></div>`;
     return;
   }
   if (!connected()) {
-    el.messages.innerHTML = `<div class="welcome setup"><h2>Ollama est injoignable</h2>
+    el.messages.innerHTML = onboardingHtml(
+      1,
+      `<h2>${escapeHtml(state.server.name)} est injoignable</h2>
       <p class="muted">${escapeHtml(state.server.error ?? "")}</p>
-      <ol class="setup-steps">
+      ${
+        state.server.tunnel
+          ? `<ol class="setup-steps">
+        <li>Vérifiez qu'Ollama tourne sur le serveur : <code>systemctl status ollama</code></li>
+        <li>Vérifiez la connexion SSH dans « Serveurs SSH… » (clé installée, empreinte validée).</li>
+      </ol>`
+          : `<ol class="setup-steps">
         <li>Installez Ollama : <a href="https://ollama.com/download" data-external>ollama.com/download</a> (Linux : <code>curl -fsSL https://ollama.com/install.sh | sh</code>, ou le paquet de votre distribution)</li>
         <li>Lancez le serveur : <code>ollama serve</code> (ou <code>systemctl start ollama</code>)</li>
-        <li>Serveur sur une autre machine ? Indiquez son adresse dans les réglages.</li>
-      </ol>
-      <p class="row center"><button class="btn-primary" data-retry-server>Réessayer</button><button class="btn-ghost" data-open-settings>Adresse du serveur…</button></p>
-    </div>`;
+        <li>Ollama sur une autre machine ? Ajoutez-la dans les réglages : adresse directe ou tunnel SSH.</li>
+      </ol>`
+      }
+      <p class="row center"><button class="btn-primary" data-retry-server>Réessayer</button><button class="btn-ghost" data-open-settings>Serveurs…</button></p>
+      <p class="muted small">La connexion est retentée automatiquement toutes les 15 secondes.</p>`,
+    );
     return;
   }
   if (state.modelsLoaded && !state.models.length) {
-    el.messages.innerHTML = `<div class="welcome"><h2>Aucun modèle installé</h2>
-      <p>Connecté à Ollama ${escapeHtml(state.server.version ?? "")}. Téléchargez un premier modèle pour commencer.</p>
-      <p><button class="btn-primary" data-open-models>Choisir un modèle</button></p>
-      <p class="muted small">Pour démarrer : <code>ministral-3:8b</code> (Mistral AI, ≈ 6 Go) ou <code>qwen3:8b</code> ; pour l'agent de code, un modèle gérant les outils comme <code>devstral-small-2</code> ou <code>qwen3-coder:30b</code>.</p>
-    </div>`;
+    el.messages.innerHTML = onboardingHtml(
+      2,
+      `<h2>Choisissez un premier modèle</h2>
+      <p>Connecté à Ollama ${escapeHtml(state.server.version ?? "")}. Le modèle est téléchargé une fois, puis tourne entièrement sur votre machine.</p>
+      <div class="starter-models">${STARTER_MODELS.map(
+        (m) => `<button class="starter" data-pull-model="${m.id}"><strong>${m.title}</strong><code>${m.id}</code><small>${m.desc}</small></button>`,
+      ).join("")}</div>
+      <p><button class="btn-ghost" data-open-models>Voir tous les modèles…</button></p>`,
+    );
+    return;
+  }
+  if (!state.settings.onboarded) {
+    el.messages.innerHTML = onboardingHtml(
+      3,
+      `<h2>Tout est prêt</h2>
+      <p>${state.models.length} modèle${state.models.length > 1 ? "s" : ""} disponible${state.models.length > 1 ? "s" : ""} sur votre serveur Ollama. Rien ne quitte votre machine.</p>
+      <div class="tips">
+        <div class="tip"><strong>Chat</strong><small>Posez une question, joignez une image, un PDF ou du code. Plusieurs conversations peuvent tourner en même temps.</small></div>
+        <div class="tip"><strong>Code</strong><small>Un agent lit, modifie et teste un projet local ou sur un serveur SSH, avec votre accord à chaque étape.</small></div>
+        <div class="tip"><strong>${state.platform.os === "macos" ? "⌘" : "Ctrl+"}K</strong><small>La palette de commandes : actions, conversations, modèles et projets au clavier.</small></div>
+      </div>
+      <p><button class="btn-primary" data-finish-onboarding>Commencer</button></p>`,
+    );
     return;
   }
   if (state.mode === "code") {
@@ -844,9 +1008,16 @@ function renderWelcome() {
   const hour = new Date().getHours();
   const greet = hour < 6 || hour >= 18 ? "Bonsoir" : "Bonjour";
   const p = findProject(state.draft.projectId);
+  const applied = state.draft.assistant;
+  const cards = `<div class="assistant-cards">${assistants()
+    .map(
+      (a) => `<button class="assistant-card${a.name === applied ? " on" : ""}" data-assistant="${escapeHtml(a.id)}" title="${escapeHtml(a.description || a.systemPrompt.slice(0, 200))}">
+        <strong>${escapeHtml(a.name)}</strong><small>${escapeHtml(a.description || a.model || "modèle par défaut")}</small></button>`,
+    )
+    .join("")}<button class="assistant-card add" data-new-assistant>＋ ${assistants().length ? "Nouvel assistant" : "Créer un assistant"}</button></div>`;
   el.messages.innerHTML = p
     ? `<div class="welcome"><h2>${escapeHtml(p.name)}</h2><p>Nouvelle conversation dans ce projet.</p>${projectBanner()}</div>`
-    : `<div class="welcome"><h2>${greet} 👋</h2><p>Comment puis-je vous aider ?</p></div>`;
+    : `<div class="welcome wide"><h2>${applied ? escapeHtml(applied) : `${greet} 👋`}</h2><p>${applied ? "Assistant sélectionné pour cette conversation." : "Comment puis-je vous aider ?"}</p>${cards}</div>`;
 }
 
 function instrHint(ws: string): string {
@@ -880,8 +1051,8 @@ function messageHtml(m: Message, next: Message | undefined): string {
     return `<div class="msg auto" data-id="${m.id}">↻ Relance automatique : l'agent avait annoncé une action sans l'exécuter</div>`;
   }
   if (m.role === "user") {
-    const imgs = (m.images ?? []).map((src) => `<img src="${src}" alt="image jointe" />`).join("");
-    const files = (m.files ?? []).map((f) => `<span class="chip">${icons.file}${escapeHtml(f.name)}</span>`).join("");
+    const imgs = (m.images ?? []).map((src, i) => `<img src="${src}" alt="image jointe" data-image="${i}" title="Agrandir" />`).join("");
+    const files = (m.files ?? []).map((f, i) => `<button type="button" class="chip" data-file="${i}" title="Afficher le contenu">${icons.file}${escapeHtml(f.name)}</button>`).join("");
     return `<div class="msg user" data-id="${m.id}">
       ${imgs || files ? `<div class="msg-attachments">${imgs}${files}</div>` : ""}
       <div class="bubble">${escapeHtml(m.content).replace(/\n/g, "<br>")}</div>
@@ -891,13 +1062,13 @@ function messageHtml(m: Message, next: Message | undefined): string {
       </div>
     </div>`;
   }
-  const streaming = state.busy?.msgId === m.id;
+  const streaming = currentRun()?.msgId === m.id;
   const reasoning = m.reasoning
     ? `<details class="reasoning"${streaming && !m.content ? " open" : ""}><summary>Raisonnement</summary><div class="md">${renderMarkdown(m.reasoning)}</div></details>`
     : "";
   const tools = (m.toolCalls ?? []).map((tc) => toolCardHtml(tc, state.risks.get(tc.name) ?? guessRisk(tc.name))).join("");
   const body = m.content
-    ? renderMarkdown(m.content)
+    ? linkCitations(renderMarkdown(m.content))
     : streaming && !m.reasoning && !tools ? '<span class="typing"><i></i><i></i><i></i></span>' : "";
   const meta = [m.model, m.usage ? `${m.usage.promptTokens} → ${m.usage.completionTokens} tokens` : "", fmtSpeed(m.usage?.tokensPerSec), m.cancelled ? "interrompu" : ""]
     .filter(Boolean)
@@ -906,17 +1077,54 @@ function messageHtml(m: Message, next: Message | undefined): string {
     ? `<div class="msg-error">${escapeHtml(m.error)} <button class="btn-ghost sm" data-act="retry">Réessayer</button></div>`
     : "";
   const endOfTurn = !next || next.role === "user";
+  const undoCount = !next && state.current ? undoable(state.current).length : 0;
+  // Comparaison avec un autre modèle : dernière réponse d'un tour simple (sans appel d'outil).
+  const msgs = state.current?.messages ?? [];
+  const canCompare = !next && !m.toolCalls?.length && !m.alt && !!m.content && msgs[msgs.indexOf(m) - 1]?.role === "user" && state.models.length > 1;
   // Pendant l'exécution, le dernier message n'a pas encore d'actions (copier, régénérer…).
-  const actions = streaming || !endOfTurn || (state.busy && !next)
+  const actions = streaming || !endOfTurn || (currentRun() && !next)
     ? ""
     : `<div class="msg-actions">
         <button class="icon-btn sm" data-act="copy" title="Copier">${icons.copy}</button>
         ${!next ? `<button class="icon-btn sm" data-act="retry" title="Régénérer">${icons.retry}</button>` : ""}
+        ${canCompare ? `<button class="icon-btn sm" data-act="compare" title="Comparer avec un autre modèle">${icons.compare}</button>` : ""}
+        ${undoCount ? `<button class="btn-ghost sm" data-undo-turn title="Remet les fichiers dans l'état d'avant ce tour de l'agent">↶ Annuler ${undoCount > 1 ? `les ${undoCount} modifications` : "la modification"}</button>` : ""}
         <span class="meta">${escapeHtml(meta)}</span>
       </div>`;
+  if (m.alt) {
+    // Deux réponses côte à côte : la réponse d'origine et celle du second modèle.
+    const a = m.alt;
+    const stat = (u: Message["usage"]) => (u ? [`${u.completionTokens} tokens`, fmtSpeed(u.tokensPerSec)].filter(Boolean).join(" · ") : "");
+    const altBody = a.error
+      ? `<div class="msg-error">${escapeHtml(a.error)}</div>`
+      : a.content
+        ? `<div class="md">${renderMarkdown(a.content)}</div>`
+        : a.reasoning
+          ? `<details class="reasoning" open><summary>Raisonnement</summary><div class="md">${renderMarkdown(a.reasoning)}</div></details>`
+          : '<span class="typing"><i></i><i></i><i></i></span>';
+    return `<div class="msg assistant has-alt" data-id="${m.id}">
+      <div class="compare">
+        <div class="cmp-col"><div class="cmp-head"><code>${escapeHtml(m.model ?? "")}</code><span>${escapeHtml(stat(m.usage))}</span></div>${body ? `<div class="md">${body}</div>` : ""}</div>
+        <div class="cmp-col"><div class="cmp-head"><code>${escapeHtml(a.model)}</code><span>${escapeHtml(stat(a.usage))}</span><span class="spacer"></span>${
+          currentRun()
+            ? ""
+            : `<button class="btn-ghost sm" data-act="keep-alt" title="Garder cette réponse à la place de l'autre">Garder</button>
+               <button class="icon-btn sm" data-act="drop-alt" title="Fermer la comparaison">×</button>`
+        }</div>${altBody}</div>
+      </div>
+    </div>`;
+  }
   return `<div class="msg assistant${streaming ? " streaming" : ""}" data-id="${m.id}">
     ${reasoning}${body ? `<div class="md">${body}</div>` : ""}${tools ? `<div class="tools">${tools}</div>` : ""}${error}${actions}
   </div>`;
+}
+
+/** Rend cliquables les noms de fichiers de référence du projet cités dans une réponse. */
+function linkCitations(html: string): string {
+  const files = findProject(state.current?.projectId)?.files;
+  if (!files?.length) return html;
+  const names = new Set(files.map((f) => escapeHtml(f.name)));
+  return html.replace(/<code>([^<]+)<\/code>/g, (all, name) => (names.has(name) ? `<code class="cite" title="Ouvrir ce fichier de référence">${name}</code>` : all));
 }
 
 /** Risque déduit du nom quand la définition n'est pas (encore) chargée. */
@@ -991,6 +1199,17 @@ el.messages.addEventListener("click", async (ev) => {
   const t = ev.target as HTMLElement;
   if (t.closest("[data-open-settings]")) return openSettings();
   if (t.closest("[data-open-models]")) return openModelsDialog();
+  if (t.closest("[data-new-assistant]")) return openAssistantsDialog(null);
+  const card = assistants().find((a) => a.id === t.closest<HTMLElement>("[data-assistant]")?.dataset.assistant);
+  if (card) return useAssistant(card);
+  const starter = t.closest<HTMLElement>("[data-pull-model]");
+  if (starter) return openModelsDialog(starter.dataset.pullModel);
+  if (t.closest("[data-finish-onboarding]")) {
+    state.settings.onboarded = true;
+    api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
+    renderWelcome();
+    return el.input.focus();
+  }
   if (t.closest("[data-retry-server]")) {
     state.server = null;
     renderWelcome();
@@ -1010,8 +1229,43 @@ el.messages.addEventListener("click", async (ev) => {
   const approve = t.closest<HTMLElement>("[data-approve]");
   if (approve) {
     const id = approve.closest<HTMLElement>("[data-tc]")?.dataset.tc;
-    const resolve = id && state.approvals.get(id);
-    if (resolve) resolve(approve.dataset.approve as "allow" | "always" | "deny");
+    const resolve = id && currentRun()?.approvals.get(id);
+    const card = approve.closest<HTMLElement>("[data-tc]");
+    const pw = card?.querySelector<HTMLInputElement>(".sudo-pw");
+    if (resolve) {
+      resolve(approve.dataset.approve as Decision, pw ? { password: pw.value, keep: !!card?.querySelector<HTMLInputElement>(".sudo-keep")?.checked } : undefined);
+    }
+    return;
+  }
+  if (t.closest("[data-forget-sudo]") && state.current) {
+    // Mot de passe oublié : la carte redemande la saisie.
+    sudoCache.delete(sudoTarget(state.current));
+    for (const m of state.current.messages) for (const tc of m.toolCalls ?? []) if (tc.status === "pending" && tc.sudo) tc.sudo = "ask";
+    return renderConversation();
+  }
+  if (t.closest("[data-undo-turn]")) return undoTurn(t.closest<HTMLElement>("[data-undo-turn]")!);
+  if (t.closest("[data-run-plan]")) return runPlan();
+
+  const previewBtn = t.closest<HTMLElement>(".preview-code");
+  if (previewBtn) {
+    const code = previewBtn.closest(".code-block")?.querySelector("code")?.textContent ?? "";
+    const kind = previewBtn.dataset.kind as PreviewKind;
+    return openPreview({ title: kind === "svg" ? "Aperçu SVG" : "Aperçu HTML", kind, content: code });
+  }
+  // Pièces jointes d'un message et fichiers de référence cités : affichage dans le panneau d'aperçu.
+  const attached = t.closest<HTMLElement>("[data-image], [data-file]");
+  if (attached && state.current) {
+    const m = state.current.messages.find((x) => x.id === attached.closest<HTMLElement>(".msg")?.dataset.id);
+    const image = m?.images?.[Number(attached.dataset.image)];
+    const file = m?.files?.[Number(attached.dataset.file)];
+    if (attached.dataset.image !== undefined && image) return openPreview({ title: "Image jointe", kind: "image", content: image });
+    if (file) return openPreview({ title: file.name, kind: "text", content: file.text });
+    return;
+  }
+  const cite = t.closest<HTMLElement>("code.cite");
+  if (cite) {
+    const file = findProject(state.current?.projectId)?.files.find((f) => f.name === cite.textContent);
+    if (file) openPreview({ title: file.name, kind: "text", content: file.text });
     return;
   }
 
@@ -1034,6 +1288,30 @@ el.messages.addEventListener("click", async (ev) => {
       return regenerate(msg);
     case "edit":
       return editMessage(msg, msgEl);
+    case "compare":
+      return openModelMenu(actBtn, {
+        selected: "",
+        exclude: [msg.model ?? ""],
+        title: "Comparer avec…",
+        pick: (model) => compare(msg, model),
+      });
+    case "keep-alt":
+    case "drop-alt":
+      // « Garder » : la réponse du second modèle remplace celle d'origine.
+      if (actBtn.dataset.act === "keep-alt" && msg.alt && !msg.alt.error) {
+        Object.assign(msg, { content: msg.alt.content, model: msg.alt.model, usage: msg.alt.usage, reasoning: msg.alt.reasoning });
+      }
+      delete msg.alt;
+      rerenderMessage(msg, true);
+      return saveCurrent();
+  }
+});
+
+el.messages.addEventListener("keydown", (e) => {
+  const t = e.target as HTMLElement;
+  if (e.key === "Enter" && t.classList.contains("sudo-pw")) {
+    e.preventDefault();
+    t.closest("[data-tc]")?.querySelector<HTMLElement>('[data-approve="allow"]')?.click();
   }
 });
 
@@ -1048,7 +1326,7 @@ function turnText(msg: Message): string {
 }
 
 function editMessage(msg: Message, node: HTMLElement) {
-  if (state.busy) return;
+  if (currentRun()) return;
   const bubble = node.querySelector<HTMLElement>(".bubble")!;
   const box = document.createElement("div");
   box.className = "edit-box";
@@ -1076,8 +1354,68 @@ function editMessage(msg: Message, node: HTMLElement) {
   });
 }
 
+/** Envoie la même question à un second modèle et affiche les deux réponses côte à côte. */
+async function compare(msg: Message, model: string) {
+  const conv = state.current;
+  if (!conv || state.runs.has(conv.id)) return;
+  const idx = conv.messages.indexOf(msg);
+  if (idx < 0) return;
+  const now = Date.now();
+  const run = startRun(conv, { phase: "Comparaison…", detail: model, since: now, runStart: now, step: 0, maxSteps: 0 });
+  const alt = (msg.alt = { model, content: "" } as NonNullable<Message["alt"]>);
+  run.requestId = uid();
+  updateComposerState();
+  renderSidebar();
+  rerenderMessage(msg, true);
+  try {
+    // Même historique jusqu'à la question, sans outils : seules les réponses sont comparées.
+    const messages = toApiMessages({ ...conv, messages: conv.messages.slice(0, idx) }, sysPrompt(conv));
+    await api.chat(
+      run.requestId,
+      {
+        model,
+        messages,
+        temperature: conv.params?.temperature ?? state.settings.temperature,
+        maxTokens: state.settings.maxTokens,
+        tools: [],
+        ...chatOptions({ model, params: conv.params }),
+      },
+      (ev) => {
+        if (ev.type === "delta") {
+          alt.content += ev.text;
+          setActivity(run, "Comparaison : rédaction…", model);
+        } else if (ev.type === "reasoning") {
+          alt.reasoning = (alt.reasoning ?? "") + ev.text;
+          setActivity(run, "Comparaison : réflexion…", model);
+        } else if (ev.type === "usage") {
+          alt.usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, tokensPerSec: ev.tokensPerSec };
+          recordUsage(conv, model, ev.promptTokens, ev.completionTokens, true);
+        } else if (ev.type === "retry") {
+          setActivity(run, "Nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
+        } else if (ev.type === "done" && ev.cancelled && !alt.content) {
+          alt.error = "Comparaison interrompue.";
+        }
+        rerenderMessage(msg);
+      },
+    );
+    if (!alt.content && !alt.error) alt.error = "Réponse vide du modèle.";
+  } catch (e) {
+    alt.error = errMsg(e);
+  } finally {
+    endRun(run);
+    if (viewing(conv)) {
+      rerenderMessage(msg, true);
+      updateComposerState();
+      renderActivity();
+      renderUsage();
+    }
+    renderSidebar();
+    await save(conv);
+  }
+}
+
 async function regenerate(msg: Message) {
-  if (state.busy || !state.current) return;
+  if (currentRun() || !state.current) return;
   const msgs = state.current.messages;
   let idx = msgs.indexOf(msg);
   // On repart du dernier message utilisateur précédant ce tour.
@@ -1090,19 +1428,23 @@ async function regenerate(msg: Message) {
 
 // ---------------------------------------------------------------- envoi et boucle d'agent
 
-async function saveCurrent() {
-  if (!state.current) return;
-  state.current.updatedAt = Date.now();
+async function save(conv: Conversation) {
+  if (deletedConvs.has(conv.id)) return;
+  conv.updatedAt = Date.now();
   try {
-    await api.saveConversation(state.current);
+    await api.saveConversation(conv);
     await refreshConvs();
   } catch (e) {
     toast(`Sauvegarde impossible : ${errMsg(e)}`, true);
   }
 }
 
+const saveCurrent = async () => {
+  if (state.current) await save(state.current);
+};
+
 async function send() {
-  if (state.busy) return stop();
+  if (currentRun()) return stop();
   const text = el.input.value.trim();
   const { images, files } = state.pending;
   if (!text && !images.length && !files.length) return;
@@ -1141,7 +1483,9 @@ async function send() {
       model,
       createdAt: now,
       updatedAt: now,
-      systemPrompt: state.settings.systemPrompt || null,
+      systemPrompt: o.systemPrompt ?? (state.settings.systemPrompt || null),
+      ...(o.params ? { params: o.params } : {}),
+      ...(o.assistant ? { assistant: o.assistant } : {}),
       messages: [],
       workspace: o.workspace,
       permissionMode: o.permissionMode,
@@ -1151,6 +1495,7 @@ async function send() {
       ...(o.projectId ? { projectId: o.projectId } : {}),
     };
   }
+  for (const m of state.current.messages) for (const tc of m.toolCalls ?? []) delete tc.undo;
   state.current.messages.push({
     id: uid(),
     role: "user",
@@ -1178,20 +1523,19 @@ const toolCtx = (c: Conversation): ToolContext => ({
 
 let activityTimer = 0;
 
-function setActivity(phase: string, detail?: string, extra: Partial<Activity> = {}) {
-  const a = state.activity;
-  if (!a) return;
+function setActivity(run: Run, phase: string, detail?: string, extra: Partial<Activity> = {}) {
+  const a = run.activity;
   if (a.phase !== phase || a.detail !== detail) {
     Object.assign(a, { phase, detail, since: Date.now(), until: undefined }, extra);
   } else {
     Object.assign(a, extra);
   }
-  renderActivity();
+  if (viewing(run.conv)) renderActivity();
 }
 
 function renderActivity() {
-  const a = state.activity;
-  const done = state.lastRun && state.lastRun.convId === state.current?.id ? state.lastRun : null;
+  const a = currentRun()?.activity;
+  const done = state.current ? state.lastRuns.get(state.current.id) : undefined;
   if (a) {
     const now = Date.now();
     const wait = a.until ? ` ${Math.max(0, Math.ceil((a.until - now) / 1000))} s` : "";
@@ -1205,7 +1549,9 @@ function renderActivity() {
     const icon = done.kind === "done" ? "✓" : done.kind === "stopped" ? "■" : "⚠";
     el.activity.className = `activity ${done.kind}`;
     el.activity.innerHTML = `<span class="act-icon">${icon}</span><span>${escapeHtml(done.text)}</span>${
-      done.canContinue ? '<button type="button" class="btn-primary sm" data-continue>Continuer</button>' : ""
+      done.plan
+        ? '<button type="button" class="btn-primary sm" data-run-plan title="Quitte le mode plan (chaque action reste soumise à votre accord) et lance l\'exécution">Exécuter le plan</button>'
+        : done.canContinue ? '<button type="button" class="btn-primary sm" data-continue>Continuer</button>' : ""
     }`;
     el.activity.hidden = false;
   } else {
@@ -1213,13 +1559,29 @@ function renderActivity() {
   }
 }
 
+/** Démarre l'exécution d'une conversation (chronomètre de la barre d'activité compris). */
+function startRun(conv: Conversation, activity: Activity): Run {
+  const run: Run = { conv, requestId: "", msgId: "", stopped: false, activity, approvals: new Map() };
+  state.runs.set(conv.id, run);
+  state.lastRuns.delete(conv.id);
+  clearInterval(activityTimer);
+  activityTimer = window.setInterval(renderActivity, 1000);
+  return run;
+}
+
+function endRun(run: Run) {
+  state.runs.delete(run.conv.id);
+  for (const resolve of [...run.approvals.values()]) resolve("deny");
+  run.approvals.clear();
+  if (!state.runs.size) clearInterval(activityTimer);
+}
+
 el.activity.addEventListener("click", (e) => {
-  if (!(e.target as HTMLElement).closest("[data-continue]") || state.busy) return;
+  if ((e.target as HTMLElement).closest("[data-run-plan]")) return runPlan();
+  if (!(e.target as HTMLElement).closest("[data-continue]") || currentRun()) return;
   el.input.value = "Continue.";
   send();
 });
-
-const maxContext = (model: string) => contextFor(model);
 
 function renderUsage() {
   const c = state.current;
@@ -1228,9 +1590,9 @@ function renderUsage() {
     el.usageInfo.hidden = true;
     return;
   }
-  const model = state.busy ? c.model : state.selectedModel || c.model;
+  const model = currentRun() ? c.model : state.selectedModel || c.model;
   const ctx = contextTokens(c, () => toApiMessages(c, sysPrompt(c)));
-  const max = maxContext(model);
+  const max = contextFor(model, c);
   const pct = max ? Math.min(100, Math.round((ctx.tokens / max) * 100)) : null;
   el.ctxMeter.hidden = false;
   el.ctxMeter.classList.toggle("warn", (pct ?? 0) >= 70);
@@ -1255,20 +1617,20 @@ function renderUsage() {
 
 el.ctxMeter.addEventListener("click", async () => {
   const c = state.current;
-  if (!c || state.busy || !c.messages.length) return;
-  state.busy = { requestId: "", msgId: "", stopped: false };
-  state.activity = { phase: "", since: Date.now(), runStart: Date.now(), step: 0, maxSteps: 0 };
+  if (!c || currentRun() || !c.messages.length) return;
+  const run = startRun(c, { phase: "", since: Date.now(), runStart: Date.now(), step: 0, maxSteps: 0 });
   updateComposerState();
   try {
-    await compact(c);
+    await compact(run);
     toast("Historique compacté");
   } catch (e) {
     toast(`Compaction impossible : ${errMsg(e)}`, true);
   } finally {
-    state.busy = null;
-    state.activity = null;
-    updateComposerState();
-    renderConversation();
+    endRun(run);
+    if (viewing(c)) {
+      updateComposerState();
+      renderConversation();
+    }
     renderSidebar();
   }
 });
@@ -1284,8 +1646,9 @@ function recordUsage(conv: Conversation, model: string, promptTokens: number, co
 }
 
 /** Résume l'historique pour libérer le contexte ; les messages restent affichés. */
-async function compact(conv: Conversation) {
-  setActivity("Compaction du contexte…", "résumé de l'historique par le modèle");
+async function compact(run: Run) {
+  const conv = run.conv;
+  setActivity(run, "Compaction du contexte…", "résumé de l'historique par le modèle");
   const messages: ApiMessage[] = toApiMessages(conv, sysPrompt(conv));
   if (messages[messages.length - 1]?.role === "tool") messages.push({ role: "assistant", content: "(Pause.)" });
   messages.push({ role: "user", content: COMPACT_PROMPT });
@@ -1294,25 +1657,25 @@ async function compact(conv: Conversation) {
   // Les définitions d'outils accompagnent l'historique (qui contient des appels), mais sans appel possible.
   const tools = await api.toolDefinitions(toolCtx(conv)).catch(() => []);
   const requestId = uid();
-  if (state.busy) state.busy.requestId = requestId;
+  run.requestId = requestId;
   await api.chat(
     requestId,
-    { model: conv.model, messages, temperature: 0.2, maxTokens: 4000, tools: tools.map((t) => t.definition), toolChoice: "none", ...chatOptions(conv.model, false) },
+    { model: conv.model, messages, temperature: 0.2, maxTokens: 4000, tools: tools.map((t) => t.definition), toolChoice: "none", ...chatOptions(conv, false) },
     (ev) => {
       if (ev.type === "delta") summary += ev.text;
       else if (ev.type === "usage") recordUsage(conv, conv.model, ev.promptTokens, ev.completionTokens, true);
-      else if (ev.type === "retry") setActivity("Compaction : nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
+      else if (ev.type === "retry") setActivity(run, "Compaction : nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
       else if (ev.type === "done" && ev.cancelled) failed = "annulée";
     },
   );
   if (failed || !summary.trim()) throw new Error(failed || "résumé vide");
   conv.compaction = { summary: summary.trim(), upto: conv.messages.length, at: Date.now() };
-  await saveCurrent();
+  await save(conv);
 }
 
 const shouldCompact = (conv: Conversation) => {
   const pctLimit = state.settings.autoCompactPercent;
-  const max = maxContext(conv.model);
+  const max = contextFor(conv.model, conv);
   if (!pctLimit || !max || conv.messages.length < 4) return false;
   if (conv.compaction && conv.compaction.upto >= conv.messages.length - 1) return false;
   const ctx = contextTokens(conv, () => toApiMessages(conv, sysPrompt(conv)));
@@ -1322,11 +1685,12 @@ const shouldCompact = (conv: Conversation) => {
 // ---------------------------------------------------------------- boucle d'agent
 
 /** Un tour du modèle en streaming. Renvoie false en cas d'erreur ou d'arrêt. */
-async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<ReturnType<typeof api.toolDefinitions>>): Promise<boolean> {
+async function streamTurn(run: Run, msg: Message, tools: Awaited<ReturnType<typeof api.toolDefinitions>>): Promise<boolean> {
+  const conv = run.conv;
   const requestId = uid();
-  if (state.busy) Object.assign(state.busy, { requestId, msgId: msg.id });
+  Object.assign(run, { requestId, msgId: msg.id });
   const messages = toApiMessages({ ...conv, messages: conv.messages.filter((m) => m !== msg) }, sysPrompt(conv));
-  setActivity("En attente du modèle…", `${conv.model} · chargement et lecture de l'invite`);
+  setActivity(run, "En attente du modèle…", `${conv.model} · chargement et lecture de l'invite`);
   let ok = true;
   try {
     await api.chat(
@@ -1334,20 +1698,20 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
       {
         model: conv.model,
         messages,
-        temperature: state.settings.temperature,
+        temperature: conv.params?.temperature ?? state.settings.temperature,
         maxTokens: state.settings.maxTokens,
         tools: tools.map((t) => t.definition),
-        ...chatOptions(conv.model),
+        ...chatOptions(conv),
       },
       (ev) => {
         switch (ev.type) {
           case "delta":
             msg.content += ev.text;
-            setActivity("Rédaction…", `≈ ${fmtTokens(Math.round(msg.content.length / 3.5))} tokens`);
+            setActivity(run, "Rédaction…", `≈ ${fmtTokens(Math.round(msg.content.length / 3.5))} tokens`);
             break;
           case "reasoning":
             msg.reasoning = (msg.reasoning ?? "") + ev.text;
-            setActivity("Réflexion…", `≈ ${fmtTokens(Math.round(msg.reasoning.length / 3.5))} tokens`);
+            setActivity(run, "Réflexion…", `≈ ${fmtTokens(Math.round(msg.reasoning.length / 3.5))} tokens`);
             break;
           case "usage":
             msg.usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, tokensPerSec: ev.tokensPerSec };
@@ -1355,10 +1719,10 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
             break;
           case "toolCalls":
             msg.toolCalls = ev.calls.map((c) => ({ ...c, status: "queued" as const }));
-            setActivity("Préparation des actions…", `${ev.calls.length} appel(s) d'outil`);
+            setActivity(run, "Préparation des actions…", `${ev.calls.length} appel(s) d'outil`);
             break;
           case "retry":
-            setActivity("Nouvel essai dans", `${ev.reason} · tentative ${ev.attempt + 1}/${ev.maxAttempts}`, {
+            setActivity(run, "Nouvel essai dans", `${ev.reason} · tentative ${ev.attempt + 1}/${ev.maxAttempts}`, {
               until: Date.now() + ev.delaySecs * 1000,
             });
             break;
@@ -1374,7 +1738,7 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
             break;
         }
         rerenderMessage(msg);
-        if (ev.type === "usage") renderUsage();
+        if (ev.type === "usage" && viewing(conv)) renderUsage();
       },
     );
   } catch (e) {
@@ -1388,20 +1752,23 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
       tc.result = "Non exécuté (interrompu).";
     }
   }
-  return ok && !state.busy?.stopped;
+  return ok && !run.stopped;
 }
 
-function waitApproval(tc: ToolCallRec): Promise<"allow" | "always" | "deny"> {
+function waitApproval(run: Run, tc: ToolCallRec): Promise<{ decision: Decision; sudo?: SudoInput }> {
   return new Promise((resolve) => {
-    state.approvals.set(tc.id, (d) => {
-      state.approvals.delete(tc.id);
-      resolve(d);
+    run.approvals.set(tc.id, (decision, sudo) => {
+      run.approvals.delete(tc.id);
+      renderSidebar();
+      resolve({ decision, sudo });
     });
+    renderSidebar();
   });
 }
 
 /** Exécute les appels d'outils d'un message. Renvoie "ok", "denied" ou "stopped". */
-async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "denied" | "stopped"> {
+async function runToolCalls(run: Run, msg: Message): Promise<"ok" | "denied" | "stopped"> {
+  const conv = run.conv;
   const ctx = toolCtx(conv);
   const calls = msg.toolCalls ?? [];
   for (let i = 0; i < calls.length; i++) {
@@ -1415,7 +1782,7 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
       }
       rerenderMessage(msg, true);
     };
-    if (state.busy?.stopped) {
+    if (run.stopped) {
       skipRest("Non exécuté : arrêté par l'utilisateur.");
       return "stopped";
     }
@@ -1425,7 +1792,11 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
     if (ctx.system && (risk === "read" || risk === "write")) {
       tc.outside = (await api.toolOutside(ctx, tc.name, tc.arguments).catch(() => null)) ?? undefined;
     }
-    if (needsApproval(risk, tc.name, conv.permissionMode ?? "ask", state.settings, !!tc.outside)) {
+    // sudo : approbation systématique (même en mode Autonome), avec le mot de passe.
+    const sudo = usesSudo(tc) && (platformFor(conv).remote || state.platform.os !== "windows");
+    let sudoPassword = sudo ? sudoCache.get(sudoTarget(conv)) : undefined;
+    if (sudo || needsApproval(risk, tc.name, conv.permissionMode ?? "ask", state.settings, !!tc.outside)) {
+      if (sudo) tc.sudo = sudoPassword === undefined ? "ask" : "cached";
       if (risk === "write") {
         try {
           tc.diff = (await api.previewTool(ctx, tc.name, tc.arguments)) ?? undefined;
@@ -1439,15 +1810,19 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
       }
       tc.status = "pending";
       rerenderMessage(msg, true);
-      scrollBottom();
-      setActivity("En attente de votre approbation", toolLabel(tc));
-      notifyAttention();
-      const decision = await waitApproval(tc);
+      if (viewing(conv)) scrollBottom();
+      setActivity(run, "En attente de votre approbation", toolLabel(tc));
+      notifyAttention(conv);
+      const { decision, sudo: typed } = await waitApproval(run, tc);
+      // Le mot de passe a pu être oublié pendant l'attente (bouton « Oublier »).
+      if (sudo) sudoPassword = typed?.password ?? sudoCache.get(sudoTarget(conv));
+      if (typed?.keep && typed.password) sudoCache.set(sudoTarget(conv), typed.password);
+      delete tc.sudo;
       if (decision === "deny") {
         tc.status = "denied";
         tc.result = "L'utilisateur a refusé cette action. Arrête-toi et demande-lui comment procéder.";
         skipRest("Non exécuté : une action précédente a été refusée.");
-        return state.busy?.stopped ? "stopped" : "denied";
+        return run.stopped ? "stopped" : "denied";
       }
       if (decision === "always") {
         if (risk === "mcp") {
@@ -1455,35 +1830,48 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
           api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
         } else if (risk === "write" && !tc.outside) {
           conv.permissionMode = "acceptEdits";
-          renderChrome();
+          if (viewing(conv)) renderChrome();
         }
       }
     }
 
     tc.status = "running";
     rerenderMessage(msg, true);
-    setActivity("Exécution", toolLabel(tc));
+    setActivity(run, "Exécution", toolLabel(tc));
     const requestId = uid();
-    if (state.busy) Object.assign(state.busy, { requestId, msgId: msg.id });
+    Object.assign(run, { requestId, msgId: msg.id });
     try {
-      const out = await api.runTool(requestId, ctx, tc.name, tc.arguments);
+      const out = await api.runTool(requestId, ctx, tc.name, tc.arguments, {
+        sudoPassword,
+        // Sortie de la commande au fil de l'eau (seule la fin est gardée pour l'affichage).
+        onOutput: (text) => {
+          tc.live = ((tc.live ?? "") + text).slice(-8000);
+          rerenderMessage(msg);
+        },
+      });
       tc.result = out.content;
       tc.status = out.isError ? "error" : "done";
       if (out.diff) tc.diff = out.diff;
+      if (out.undo) tc.undo = out.undo;
     } catch (e) {
       tc.result = `Erreur : ${errMsg(e)}`;
       tc.status = "error";
     }
+    delete tc.live;
     rerenderMessage(msg, true);
   }
-  await saveCurrent();
-  renderUsage();
-  if (conv.kind === "code") scheduleGitRefresh();
-  return state.busy?.stopped ? "stopped" : "ok";
+  await save(conv);
+  if (viewing(conv)) {
+    renderUsage();
+    renderChanges();
+    if (conv.kind === "code") scheduleGitRefresh();
+  }
+  return run.stopped ? "stopped" : "ok";
 }
 
-/** Attire l'attention si la fenêtre n'a pas le focus (approbation requise). */
-function notifyAttention() {
+/** Approbation requise : prévient si la fenêtre n'a pas le focus ou si la conversation n'est pas affichée. */
+function notifyAttention(conv: Conversation) {
+  if (!viewing(conv)) toast(`« ${conv.title} » attend votre approbation`);
   if (document.hasFocus()) return;
   document.title = "⏸ Approbation requise — Ollama Desktop";
   window.addEventListener("focus", () => (document.title = "Ollama Desktop"), { once: true });
@@ -1491,31 +1879,35 @@ function notifyAttention() {
 
 async function runAgent() {
   const conv = state.current;
-  if (!conv) return;
+  if (!conv || state.runs.has(conv.id)) return;
   conv.model = state.selectedModel;
   const maxSteps = conv.kind === "code" ? Math.max(5, state.settings.maxSteps || 100) : MAX_CHAT_STEPS;
   const runStart = Date.now();
-  state.busy = { requestId: "", msgId: "", stopped: false };
-  state.lastRun = null;
-  state.activity = { phase: "Préparation…", since: runStart, runStart, step: 1, maxSteps };
-  clearInterval(activityTimer);
-  activityTimer = window.setInterval(renderActivity, 1000);
+  const run = startRun(conv, { phase: "Préparation…", since: runStart, runStart, step: 1, maxSteps });
   updateComposerState();
   renderSidebar();
 
   if (conv.projectId && findProject(conv.projectId)?.files.length) {
     // Gros projets : seuls les extraits pertinents pour la dernière question sont joints.
     const question = [...conv.messages].reverse().find((m) => m.role === "user" && !m.auto)?.content ?? "";
-    setActivity("Recherche dans les fichiers du projet…");
+    setActivity(run, "Recherche dans les fichiers du projet…");
     try {
-      state.projectCtx.set(conv.id, await api.projectContext(conv.projectId, question));
+      const ctx = await api.projectContext(conv.projectId, question, (done, total) =>
+        setActivity(run, "Indexation du projet…", `${done}/${total} extraits (une seule fois par extrait)`),
+      );
+      state.projectCtx.set(conv.id, ctx);
+      // Recherche par le sens indisponible (modèle absent…) : mots-clés seuls, signalé une fois.
+      if (ctx.search !== "semantic" && ctx.search !== "keywords" && !embedWarned) {
+        embedWarned = true;
+        toast(`Recherche sémantique indisponible, mots-clés seuls : ${ctx.search}`, true);
+      }
     } catch {
       state.projectCtx.delete(conv.id);
     }
   }
   if (conv.kind === "code" && conv.workspace) {
     // Relu à chaque tâche : l'agent ou l'utilisateur ont pu modifier AGENTS.md.
-    setActivity("Lecture des consignes du projet…", workspaceLabel(conv.workspace).name);
+    setActivity(run, "Lecture des consignes du projet…", workspaceLabel(conv.workspace).name);
     await loadInstructions(conv.workspace);
   }
 
@@ -1526,15 +1918,17 @@ async function runAgent() {
   } catch (e) {
     toast(`Outils indisponibles : ${errMsg(e)}`, true);
   }
+  // Mode plan : outils en lecture seule uniquement.
+  if (conv.kind === "code" && conv.permissionMode === "plan") tools = tools.filter((t) => t.risk === "read");
   if (tools.length && modelInfo(conv.model)?.tools === false) {
     // Ollama refuse la requête entière si le modèle ne gère pas les outils.
     tools = [];
     toast(`${conv.model} ne gère pas les outils : recherche web et MCP désactivés pour cette réponse.`);
   }
 
-  renderConversation();
-  await saveCurrent();
-  let outcome: Omit<RunOutcome, "convId"> = { kind: "done", text: "", canContinue: false };
+  if (viewing(conv)) renderConversation();
+  await save(conv);
+  let outcome: RunOutcome = { kind: "done", text: "", canContinue: false };
   let steps = 0;
   let nudges = 0;
   try {
@@ -1544,28 +1938,28 @@ async function runAgent() {
         break;
       }
       steps = step;
-      if (state.activity) state.activity.step = step;
+      run.activity.step = step;
       if (shouldCompact(conv)) {
         try {
-          await compact(conv);
-          renderConversation();
+          await compact(run);
+          if (viewing(conv)) renderConversation();
         } catch (e) {
           toast(`Compaction automatique impossible : ${errMsg(e)}`, true);
         }
       }
       const msg: Message = { id: uid(), role: "assistant", content: "", model: conv.model, createdAt: Date.now() };
       conv.messages.push(msg);
-      if (state.busy) state.busy.msgId = msg.id;
+      run.msgId = msg.id;
       rerenderMessage(msg, true);
-      const ok = await streamTurn(conv, msg, tools);
+      const ok = await streamTurn(run, msg, tools);
       if (!msg.content && !msg.reasoning && !msg.toolCalls?.length && !msg.error && !msg.cancelled) {
         msg.error = "Réponse vide du modèle.";
       }
       rerenderMessage(msg, true);
-      await saveCurrent();
-      renderUsage();
+      await save(conv);
+      if (viewing(conv)) renderUsage();
       if (!ok) {
-        outcome = state.busy?.stopped || msg.cancelled
+        outcome = run.stopped || msg.cancelled
           ? { kind: "stopped", text: "Arrêté à votre demande.", canContinue: true }
           : msg.error?.startsWith("Réponse tronquée")
             ? { kind: "truncated", text: "Réponse coupée : limite de tokens atteinte (réglages « Tokens max » ou « Fenêtre de contexte »).", canContinue: true }
@@ -1577,12 +1971,12 @@ async function runAgent() {
         if (conv.kind === "code" && state.settings.autoContinue && nudges < MAX_AUTO_CONTINUE && looksUnfinished(msg.content)) {
           nudges++;
           conv.messages.push({ id: uid(), role: "user", content: AUTO_CONTINUE_TEXT, createdAt: Date.now(), auto: true });
-          renderConversation();
+          if (viewing(conv)) renderConversation();
           continue;
         }
         break;
       }
-      const res = await runToolCalls(conv, msg);
+      const res = await runToolCalls(run, msg);
       if (res === "denied") {
         outcome = { kind: "denied", text: "En pause : vous avez refusé une action. Donnez vos consignes pour continuer.", canContinue: false };
         break;
@@ -1595,38 +1989,174 @@ async function runAgent() {
   } finally {
     const elapsed = fmtDuration(Date.now() - runStart);
     if (outcome.kind === "done") {
+      outcome.plan = conv.kind === "code" && conv.permissionMode === "plan";
       const u = conversationUsage(conv);
       outcome.text = `Terminé en ${elapsed} · ${steps} étape${steps > 1 ? "s" : ""} · ${fmtTokens(u.promptTokens + u.completionTokens)} tokens dans la conversation`;
     } else {
       outcome.text += ` (${elapsed}, ${steps} étape${steps > 1 ? "s" : ""})`;
     }
-    state.lastRun = { ...outcome, convId: conv.id };
-    state.busy = null;
-    state.activity = null;
-    clearInterval(activityTimer);
-    for (const resolve of state.approvals.values()) resolve("deny");
-    state.approvals.clear();
-    const last = conv.messages[conv.messages.length - 1];
-    if (last) rerenderMessage(last, true);
-    updateComposerState();
-    renderActivity();
+    endRun(run);
+    if (!deletedConvs.has(conv.id)) {
+      state.lastRuns.set(conv.id, outcome);
+      if (viewing(conv)) {
+        const last = conv.messages[conv.messages.length - 1];
+        if (last) rerenderMessage(last, true);
+        updateComposerState();
+        renderActivity();
+        renderUsage();
+      } else {
+        // Terminée en arrière-plan : pastille dans la barre latérale et notification.
+        state.unread.add(conv.id);
+        toast(outcome.kind === "done" ? `« ${conv.title} » : réponse terminée` : `« ${conv.title} » : ${outcome.text}`, outcome.kind === "error");
+      }
+    }
     renderSidebar();
-    renderUsage();
-    await saveCurrent();
+    await save(conv);
   }
 }
 
+// ---------------------------------------------------------------- fichiers modifiés par l'agent
+
+interface ChangedFile {
+  path: string;
+  diffs: { diff: string; undone: boolean }[];
+  added: number;
+  removed: number;
+}
+
+/** Fichiers écrits par l'agent dans la conversation, avec leurs diffs successifs. */
+function changedFiles(conv: Conversation | null): ChangedFile[] {
+  const files = new Map<string, ChangedFile>();
+  for (const m of conv?.messages ?? []) {
+    for (const tc of m.toolCalls ?? []) {
+      if (!tc.diff || tc.status !== "done" || (tc.name !== "write_file" && tc.name !== "edit_file")) continue;
+      let path = "";
+      try {
+        path = String(JSON.parse(tc.arguments).path ?? "");
+      } catch {
+        continue;
+      }
+      const f = files.get(path) ?? { path, diffs: [], added: 0, removed: 0 };
+      f.diffs.push({ diff: tc.diff, undone: !!tc.undone });
+      if (!tc.undone) {
+        for (const line of tc.diff.split("\n")) {
+          if (line.startsWith("+") && !line.startsWith("+++")) f.added++;
+          else if (line.startsWith("-") && !line.startsWith("---")) f.removed++;
+        }
+      }
+      files.set(path, f);
+    }
+  }
+  return [...files.values()];
+}
+
+let changesOpenPath = "";
+
+function renderChanges() {
+  const files = state.current?.kind === "code" ? changedFiles(state.current) : [];
+  el.changesBtn.hidden = files.length === 0;
+  el.changesBtn.querySelector("span")!.textContent = String(files.length);
+  if (!files.length) el.changesPanel.hidden = true;
+  if (el.changesPanel.hidden) return;
+  $("#changes-list").innerHTML = files
+    .map(
+      (f) => `<div class="git-file${f.path === changesOpenPath ? " open" : ""}" data-path="${escapeHtml(f.path)}">
+        <span class="git-name">${escapeHtml(f.path)}${f.diffs.every((d) => d.undone) ? " <small>annulé</small>" : f.diffs.length > 1 ? ` <small>${f.diffs.length} modifications</small>` : ""}</span>
+        <span class="chg-stat"><b class="add">+${f.added}</b> <b class="del">−${f.removed}</b></span>
+      </div>`,
+    )
+    .join("");
+  const open = files.find((f) => f.path === changesOpenPath) ?? files[0];
+  changesOpenPath = open.path;
+  $("#changes-diff").innerHTML = `<div class="git-diff-head"><code>${escapeHtml(open.path)}</code></div>${open.diffs
+    .map((d, i) => `${open.diffs.length > 1 ? `<div class="tool-label chg-step">Modification ${i + 1}${d.undone ? " (annulée)" : ""}</div>` : ""}${diffHtml(d.diff)}`)
+    .join("")}`;
+}
+
+el.changesBtn.addEventListener("click", () => {
+  el.changesPanel.hidden = !el.changesPanel.hidden;
+  if (!el.changesPanel.hidden) {
+    toggleGitPanel(false);
+    closePreview();
+  }
+  renderChanges();
+});
+$("#changes-close").addEventListener("click", () => (el.changesPanel.hidden = true));
+$("#changes-list").addEventListener("click", (e) => {
+  const path = (e.target as HTMLElement).closest<HTMLElement>("[data-path]")?.dataset.path;
+  if (path === undefined) return;
+  changesOpenPath = path;
+  renderChanges();
+});
+
+/** Sort du mode plan et demande à l'agent d'exécuter le plan qu'il vient de proposer. */
+function runPlan() {
+  const conv = state.current;
+  if (!conv || currentRun()) return;
+  conv.permissionMode = "ask";
+  renderChrome();
+  el.input.value = "Exécute ce plan.";
+  send();
+}
+
+/** Appels du dernier tour dont la modification de fichier peut encore être annulée. */
+function undoable(conv: Conversation): ToolCallRec[] {
+  const out: ToolCallRec[] = [];
+  for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === "assistant"; i--) {
+    for (const tc of [...(conv.messages[i].toolCalls ?? [])].reverse()) if (tc.undo && !tc.undone) out.push(tc);
+  }
+  return out; // du plus récent au plus ancien : ordre d'annulation
+}
+
+/** Annule les modifications de fichiers du dernier tour de l'agent (deux clics pour confirmer). */
+async function undoTurn(btn: HTMLElement) {
+  const conv = state.current;
+  if (!conv || currentRun()) return;
+  if (!btn.classList.contains("confirm")) {
+    btn.classList.add("confirm");
+    btn.dataset.label = btn.textContent ?? "";
+    btn.textContent = "Confirmer l'annulation";
+    setTimeout(() => {
+      if (!btn.isConnected) return;
+      btn.classList.remove("confirm");
+      btn.textContent = btn.dataset.label ?? "";
+    }, 3000);
+    return;
+  }
+  const ctx = toolCtx(conv);
+  let done = 0;
+  try {
+    for (const tc of undoable(conv)) {
+      await api.restoreFile(ctx, tc.undo!.path, tc.undo!.before);
+      tc.undone = true;
+      delete tc.undo;
+      // Le modèle voit, au tour suivant, que sa modification n'est plus en place.
+      tc.result = `${tc.result ?? ""}\n[Modification annulée ensuite par l'utilisateur : le fichier est revenu à son état précédent.]`;
+      done++;
+    }
+    toast(`${done} modification${done > 1 ? "s" : ""} annulée${done > 1 ? "s" : ""}`);
+  } catch (e) {
+    toast(`Annulation interrompue : ${errMsg(e)}`, true);
+  }
+  await saveCurrent();
+  renderConversation();
+  scheduleGitRefresh();
+}
+
+async function stopRun(run: Run) {
+  run.stopped = true;
+  for (const resolve of [...run.approvals.values()]) resolve("deny");
+  if (run.requestId) await api.cancel(run.requestId).catch(() => {});
+}
+
 async function stop() {
-  const b = state.busy;
-  if (!b) return;
-  b.stopped = true;
-  for (const resolve of [...state.approvals.values()]) resolve("deny");
-  if (b.requestId) await api.cancel(b.requestId).catch(() => {});
+  const run = currentRun();
+  if (run) await stopRun(run);
 }
 
 function updateComposerState() {
-  el.app.classList.toggle("is-streaming", !!state.busy);
-  el.sendBtn.title = state.busy ? "Arrêter (Échap)" : "Envoyer";
+  el.app.classList.toggle("is-streaming", !!currentRun());
+  el.sendBtn.title = currentRun() ? "Arrêter (Échap)" : "Envoyer";
   el.hint.textContent = state.settings?.sendOnEnter ? "Entrée pour envoyer · Maj+Entrée pour un retour ligne" : "Ctrl+Entrée pour envoyer";
 }
 
@@ -1648,7 +2178,6 @@ el.input.addEventListener("keydown", (e) => {
     send();
   }
 });
-el.modelSelect.addEventListener("change", () => pickModel(el.modelSelect.value));
 el.exportBtn.addEventListener("click", async () => {
   if (!state.current) return;
   try {
@@ -1663,13 +2192,19 @@ el.exportBtn.addEventListener("click", async () => {
 function renderAttachments() {
   const { images, files } = state.pending;
   el.attachments.innerHTML =
-    images.map((src, i) => `<span class="att img"><img src="${src}" alt="" /><button type="button" data-rm="img:${i}" title="Retirer">×</button></span>`).join("") +
-    files.map((f, i) => `<span class="att chip">${icons.file}${escapeHtml(f.name)}<button type="button" data-rm="file:${i}" title="Retirer">×</button></span>`).join("");
+    images.map((src, i) => `<span class="att img" data-show="img:${i}" title="Agrandir"><img src="${src}" alt="" /><button type="button" data-rm="img:${i}" title="Retirer">×</button></span>`).join("") +
+    files.map((f, i) => `<span class="att chip" data-show="file:${i}" title="Afficher le contenu">${icons.file}${escapeHtml(f.name)}<button type="button" data-rm="file:${i}" title="Retirer">×</button></span>`).join("");
 }
 
 el.attachments.addEventListener("click", (e) => {
   const rm = (e.target as HTMLElement).dataset.rm;
-  if (!rm) return;
+  if (!rm) {
+    const [kind, i] = ((e.target as HTMLElement).closest<HTMLElement>("[data-show]")?.dataset.show ?? "").split(":");
+    const file = state.pending.files[+i];
+    if (kind === "img" && state.pending.images[+i]) openPreview({ title: "Image jointe", kind: "image", content: state.pending.images[+i] });
+    else if (kind === "file" && file?.text) openPreview({ title: file.name, kind: "text", content: file.text });
+    return;
+  }
   const [kind, i] = rm.split(":");
   if (kind === "img") state.pending.images.splice(+i, 1);
   else state.pending.files.splice(+i, 1);
@@ -1702,6 +2237,71 @@ async function imageToDataUrl(file: File): Promise<string> {
   return canvas.toDataURL("image/jpeg", 0.88);
 }
 
+const OCR_PROMPT =
+  "Transcris fidèlement tout le texte de cette page de document, en Markdown (titres, listes, tableaux). " +
+  "N'ajoute ni commentaire ni traduction ; si la page ne contient aucun texte, réponds « (page sans texte) ».";
+
+/** Réduit une image (data URL) à la taille maximale envoyée aux modèles vision. */
+async function shrinkImage(url: string): Promise<string> {
+  const img = new Image();
+  await new Promise((res, rej) => {
+    img.onload = res;
+    img.onerror = () => rej(new Error("image illisible"));
+    img.src = url;
+  });
+  const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(img.width, img.height));
+  if (scale === 1) return url;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  canvas.getContext("2d")!.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.88);
+}
+
+/**
+ * Lit un PDF scanné : chaque page est transcrite par le modèle vision des réglages, sur le
+ * serveur Ollama. `cancelled` : l'utilisateur a retiré la pièce jointe.
+ */
+async function readScannedPdf(name: string, b64: string, progress: (page: number, pages: number) => void, cancelled: () => boolean = () => false): Promise<string> {
+  const model = state.settings.ocrModel;
+  if (!model) throw new Error("PDF scanné (sans texte) : choisissez un modèle vision dans Réglages → Outils → Documents PDF pour le lire");
+  if (!modelInfo(model)) throw new Error(`PDF scanné : le modèle vision ${model} n'est pas installé sur ce serveur`);
+  const { images, pages, skipped } = await api.pdfPageImages(b64);
+  if (!images.length) throw new Error("PDF scanné dans un format d'image non pris en charge (CCITT, JBIG2 ou JPEG 2000) : convertissez-le en images");
+  const parts: string[] = [];
+  for (const [i, image] of images.entries()) {
+    if (cancelled()) throw new Error("lecture annulée");
+    progress(i + 1, images.length);
+    let text = "";
+    const requestId = uid();
+    const watch = window.setInterval(() => cancelled() && api.cancel(requestId).catch(() => {}), 500);
+    try {
+      await api.chat(
+        requestId,
+        {
+          model,
+          messages: [{ role: "user", content: OCR_PROMPT, images: [await shrinkImage(image)] }],
+          temperature: 0,
+          maxTokens: 4000,
+          tools: [],
+          ...chatOptions({ model }, false),
+        },
+        (ev) => {
+          if (ev.type === "delta") text += ev.text;
+          else if (ev.type === "usage") api.recordUsage(today(), model, ev.promptTokens, ev.completionTokens).catch(() => {});
+        },
+      );
+    } finally {
+      clearInterval(watch);
+    }
+    parts.push(`<!-- page ${i + 1} -->\n${text.trim()}`);
+  }
+  if (cancelled()) throw new Error("lecture annulée");
+  const missing = pages - images.length - skipped;
+  if (skipped || missing > 0) toast(`${name} : ${images.length} page(s) lue(s) sur ${pages}${skipped ? `, ${skipped} dans un format non pris en charge` : ""}`);
+  return parts.join("\n\n");
+}
+
 async function addPdf(file: File) {
   if (file.size > MAX_PDF) throw new Error(`trop volumineux (max ${MAX_PDF / 1048576} Mo)`);
   const placeholder: TextFile = { name: `${file.name} (conversion…)`, text: "" };
@@ -1709,9 +2309,15 @@ async function addPdf(file: File) {
   renderAttachments();
   try {
     const b64 = (await readAsDataUrl(file)).split(",")[1];
-    const { text } = await api.processDocument(b64);
+    const res = await api.processDocument(b64);
+    const text = res.scanned
+      ? await readScannedPdf(file.name, b64, (page, pages) => {
+          placeholder.name = `${file.name} (lecture de la page ${page}/${pages}…)`;
+          renderAttachments();
+        }, () => !state.pending.files.includes(placeholder))
+      : res.text;
     if (!text.trim()) throw new Error("aucun texte extrait");
-    placeholder.name = file.name;
+    placeholder.name = res.scanned ? `${file.name} (lu par ${state.settings.ocrModel})` : file.name;
     placeholder.text = text;
   } catch (e) {
     state.pending.files.splice(state.pending.files.indexOf(placeholder), 1);
@@ -1788,20 +2394,18 @@ window.addEventListener("drop", (e) => {
 // ---------------------------------------------------------------- réglages
 
 const s = {
-  apiKey: $<HTMLInputElement>("#api-key"),
-  keyStatus: $("#key-status"),
   model: $<HTMLSelectElement>("#s-model"),
   system: $<HTMLTextAreaElement>("#s-system"),
   temp: $<HTMLInputElement>("#s-temp"),
   max: $<HTMLInputElement>("#s-max"),
   theme: $<HTMLSelectElement>("#s-theme"),
   enter: $<HTMLInputElement>("#s-enter"),
-  base: $<HTMLInputElement>("#s-base"),
-  serverStatus: $("#server-status"),
   ctx: $<HTMLSelectElement>("#s-ctx"),
   keep: $<HTMLInputElement>("#s-keep"),
   thinking: $<HTMLInputElement>("#s-thinking"),
   searx: $<HTMLInputElement>("#s-searx"),
+  embed: $<HTMLInputElement>("#s-embed"),
+  ocr: $<HTMLSelectElement>("#s-ocr"),
   webDefault: $<HTMLInputElement>("#s-web-default"),
   codeModel: $<HTMLSelectElement>("#s-code-model"),
   timeout: $<HTMLInputElement>("#s-timeout"),
@@ -1895,8 +2499,8 @@ el.updateBanner.addEventListener("click", (e) => {
 /** Télécharge, vérifie la signature, installe puis redémarre (géré côté Rust). */
 async function installUpdate() {
   if (installing) return;
-  if (state.busy) {
-    toast("Attendez la fin de la tâche en cours avant d'installer la mise à jour.", true);
+  if (state.runs.size) {
+    toast("Attendez la fin des tâches en cours avant d'installer la mise à jour.", true);
     return;
   }
   installing = true;
@@ -1949,44 +2553,6 @@ const MCP_EXAMPLE = `{
   }
 }
 `;
-
-async function refreshKeyStatus() {
-  const st = await api.keyStatus().catch(() => ({ configured: false, source: null }));
-  s.keyStatus.textContent = !st.configured
-    ? "Aucune clé : inutile pour un serveur Ollama classique."
-    : st.source === "keyring"
-      ? "✓ Clé enregistrée dans le trousseau du système."
-      : "✓ Clé lue depuis la variable d'environnement OLLAMA_API_KEY.";
-}
-
-function renderServerStatus(st: ServerStatus | null) {
-  s.serverStatus.className = st?.error ? "small error" : "muted small";
-  s.serverStatus.textContent = !st
-    ? ""
-    : st.version
-      ? `✓ Connecté à Ollama ${st.version} · ${state.models.length} modèle${state.models.length > 1 ? "s" : ""} installé${state.models.length > 1 ? "s" : ""}` +
-        (st.insecure ? " · ⚠ HTTP en clair hors de cette machine : réservez-le à un réseau de confiance (ou passez par un proxy HTTPS / VPN)." : "")
-      : `✗ ${st.error ?? "injoignable"}`;
-}
-
-$("#test-server").addEventListener("click", async () => {
-  const url = s.base.value.trim() || "http://localhost:11434";
-  s.serverStatus.className = "muted small";
-  s.serverStatus.textContent = "Test en cours…";
-  try {
-    // Le test porte sur l'URL saisie : enregistrée d'abord (validée côté Rust).
-    if (url !== state.settings.baseUrl) {
-      state.settings = { ...state.settings, baseUrl: url };
-      await api.saveSettings(state.settings);
-    }
-    await loadModels();
-    renderServerStatus(state.server);
-    fillModelSelect(s.model, s.model.value, "Automatique (premier modèle installé)");
-    fillModelSelect(s.codeModel, s.codeModel.value, "Automatique (premier modèle gérant les outils)");
-  } catch (e) {
-    renderServerStatus({ url, version: null, error: errMsg(e), insecure: false });
-  }
-});
 
 function showTab(tab: string) {
   document.querySelectorAll<HTMLElement>(".settings-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
@@ -2118,11 +2684,9 @@ s.vaultKeyAction.addEventListener("click", async () => {
 
 async function openSettings(tab = "general") {
   const st = state.settings;
-  await refreshKeyStatus();
-  s.apiKey.value = "";
+  renderServers();
   fillModelSelect(s.model, st.defaultModel, "Automatique (premier modèle installé)");
   fillModelSelect(s.codeModel, st.codeModel, "Automatique (premier modèle gérant les outils)");
-  renderServerStatus(state.server);
   s.ctx.value = String(st.numCtx ?? 16384);
   if (s.ctx.value !== String(st.numCtx)) {
     s.ctx.insertAdjacentHTML("beforeend", `<option value="${st.numCtx}">${fmtTokens(st.numCtx)}</option>`);
@@ -2134,9 +2698,22 @@ async function openSettings(tab = "general") {
   s.temp.value = st.temperature?.toString() ?? "";
   s.max.value = st.maxTokens?.toString() ?? "";
   s.theme.value = st.theme;
+  for (const r of accentRadios()) r.checked = r.value === (st.accent || "teal");
+  quickSelect.value = st.quickShortcut ?? "";
+  if (state.platform.os === "macos") for (const o of quickSelect.options) o.textContent = o.textContent!.replace("Ctrl", "Cmd").replace("Super", "Cmd").replace("Alt", "Option");
+  $("#s-quick-hint").textContent =
+    "Depuis n'importe quelle application, ouvre un champ de saisie : la question part dans une nouvelle conversation." +
+    (state.platform.os === "linux" ? " Sous Wayland, associez plutôt un raccourci du bureau à la commande « ollama-desktop --quick »." : "");
+  renderBackup();
   s.enter.checked = st.sendOnEnter;
-  s.base.value = st.baseUrl;
   s.searx.value = st.searxngUrl;
+  s.embed.value = st.embeddingModel ?? "";
+  const embedIds = [...new Set([...state.allModels.filter((m) => m.embedding).map((m) => m.id), "bge-m3", "nomic-embed-text", "embeddinggemma"])];
+  $("#embed-models").innerHTML = embedIds.map((id) => `<option value="${escapeHtml(id)}"></option>`).join("");
+  const vision = state.models.filter((m) => m.vision).map((m) => m.id);
+  if (st.ocrModel && !vision.includes(st.ocrModel)) vision.unshift(st.ocrModel);
+  s.ocr.innerHTML = '<option value="">Désactivé</option>' + vision.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
+  s.ocr.value = st.ocrModel ?? "";
   s.webDefault.checked = st.webSearchDefault;
   s.timeout.value = String(st.commandTimeout);
   s.maxSteps.value = String(st.maxSteps);
@@ -2165,37 +2742,23 @@ async function openSettings(tab = "general") {
   pollMcp();
 }
 
-$("#save-key").addEventListener("click", async () => {
-  try {
-    await api.setKey(s.apiKey.value);
-    s.apiKey.value = "";
-    await refreshKeyStatus();
-    await loadModels();
-    renderServerStatus(state.server);
-    toast("Clé API enregistrée");
-  } catch (e) {
-    s.error.textContent = errMsg(e);
-    s.error.hidden = false;
-  }
-});
-
-$("#delete-key").addEventListener("click", async () => {
-  await api.deleteKey().catch((e) => toast(errMsg(e), true));
-  await refreshKeyStatus();
-  await loadModels();
-  renderServerStatus(state.server);
-});
-
 $("#settings-cancel").addEventListener("click", () => el.settings.close());
-s.theme.addEventListener("change", () => applyTheme(s.theme.value as Settings["theme"]));
+const quickSelect = $<HTMLSelectElement>("#s-quick");
+const accentRadios = () => [...document.querySelectorAll<HTMLInputElement>('input[name="accent"]')];
+const pickedAccent = () => (accentRadios().find((r) => r.checked)?.value ?? "teal") as Settings["accent"];
+// Aperçu immédiat du thème et de l'accent ; annulé si les réglages sont fermés sans enregistrer.
+const previewTheme = () => applyTheme(s.theme.value as Settings["theme"], pickedAccent());
+s.theme.addEventListener("change", previewTheme);
+for (const r of accentRadios()) r.addEventListener("change", previewTheme);
 el.settings.addEventListener("close", () => applyTheme(state.settings.theme));
 
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const num = (v: string) => (v.trim() === "" ? null : Number(v));
+  if (!commitServerForm()) return showTab("general");
   const next: Settings = {
     ...state.settings,
-    baseUrl: s.base.value.trim() || "http://localhost:11434",
+    ...serversDraft(),
     defaultModel: s.model.value,
     systemPrompt: s.system.value,
     temperature: num(s.temp.value),
@@ -2204,8 +2767,12 @@ $("#settings-form").addEventListener("submit", async (e) => {
     keepAlive: s.keep.value.trim(),
     thinking: s.thinking.checked,
     theme: s.theme.value as Settings["theme"],
+    accent: pickedAccent(),
+    quickShortcut: quickSelect.value,
     sendOnEnter: s.enter.checked,
     searxngUrl: s.searx.value.trim(),
+    embeddingModel: s.embed.value.trim(),
+    ocrModel: s.ocr.value,
     webSearchDefault: s.webDefault.checked,
     codeModel: s.codeModel.value,
     commandTimeout: Math.max(5, Number(s.timeout.value) || 120),
@@ -2231,7 +2798,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
     return showTab("tools");
   }
   try {
-    const baseChanged = next.baseUrl !== state.settings.baseUrl;
+    const serverKey = (x: Settings) => JSON.stringify([x.servers, x.activeServer]);
+    const baseChanged = serverKey(next) !== serverKey(state.settings);
     await api.saveSettings(next);
     if (next.encryptData !== state.settings.encryptData || next.encryptData) {
       const v = await api.vaultStatus().catch(() => null);
@@ -2239,6 +2807,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
       else if (next.encryptData !== state.settings.encryptData) toast(next.encryptData ? "Données chiffrées" : "Chiffrement désactivé : données déchiffrées");
     }
     const shellChanged = next.shell !== state.settings.shell;
+    if (next.quickShortcut !== state.settings.quickShortcut) api.quickApplyShortcut().catch((e) => toast(errMsg(e), true));
+    if (next.embeddingModel !== state.settings.embeddingModel) embedWarned = false;
     state.settings = next;
     if (shellChanged) state.platform = await api.platform().catch(() => state.platform);
     applyTheme(next.theme);
@@ -2247,8 +2817,13 @@ $("#settings-form").addEventListener("submit", async (e) => {
       state.draft.webSearch = next.webSearchDefault;
     }
     el.settings.close();
-    if (baseChanged) await loadModels();
-    else fillModelSelect(el.modelSelect, state.selectedModel);
+    if (baseChanged) {
+      state.server = null;
+      state.models = state.allModels = [];
+      state.modelsLoaded = false;
+      await loadModels();
+    }
+    renderServerChip();
     renderChrome();
     if (!state.current) renderWelcome();
   } catch (err) {
@@ -2261,6 +2836,16 @@ $("#open-settings").addEventListener("click", () => openSettings());
 $("#models-btn").addEventListener("click", () => openModelsDialog());
 $("#new-chat").addEventListener("click", newChat);
 $("#toggle-sidebar").addEventListener("click", () => el.app.classList.toggle("sidebar-hidden"));
+
+// Anneau de focus réservé au clavier : la dernière modalité d'entrée est notée sur <html>.
+window.addEventListener("pointerdown", () => (document.documentElement.dataset.input = "pointer"), true);
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key === "Tab" || e.key.startsWith("Arrow")) document.documentElement.dataset.input = "keyboard";
+  },
+  true,
+);
 
 // Liens : toujours dans le navigateur du système, jamais dans la WebView.
 document.addEventListener("click", (e) => {
@@ -2285,7 +2870,7 @@ window.addEventListener("keydown", (e) => {
     el.app.classList.toggle("sidebar-hidden");
   } else if (mod && k === "k") {
     e.preventDefault();
-    el.search.focus();
+    openPalette();
   } else if (mod && k === "g" && opts().kind === "code" && opts().workspace) {
     e.preventDefault();
     toggleGitPanel();
@@ -2307,10 +2892,86 @@ window.addEventListener("keydown", (e) => {
     document.querySelector<HTMLDialogElement>("dialog[open]")!.close();
   } else if (e.key === "Escape" && cancelDictation()) {
     e.preventDefault();
-  } else if (e.key === "Escape" && state.busy) {
+  } else if (e.key === "Escape" && currentRun()) {
     stop();
   }
 });
+
+// ---------------------------------------------------------------- palette de commandes
+
+function setTheme(theme: Settings["theme"]) {
+  state.settings.theme = theme;
+  applyTheme(theme);
+  api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
+}
+
+function paletteItems(q: string): PaletteItem[] {
+  const o = opts();
+  const actions: PaletteItem[] = [
+    { group: "Actions", label: "Nouvelle conversation", hint: "Ctrl+N", keywords: "chat discuter", run: () => { state.mode = "chat"; newChat(); } },
+    { group: "Actions", label: "Nouvelle session de code", hint: "Ctrl+2", keywords: "agent projet dossier", run: () => { state.mode = "code"; newChat(); } },
+    { group: "Actions", label: "Gérer les modèles", hint: "Ctrl+M", keywords: "télécharger installer supprimer décharger pull", run: () => openModelsDialog() },
+    { group: "Actions", label: "Réglages", hint: "Ctrl+,", keywords: "préférences configuration serveur", run: () => openSettings() },
+    { group: "Actions", label: "Serveurs SSH…", keywords: "distant remote connexion clé", run: () => openSshDialog() },
+    { group: "Actions", label: "Nouveau projet…", keywords: "consignes fichiers", run: () => newProject() },
+    { group: "Actions", label: "Assistants…", keywords: "persona rôle consignes préréglage", run: () => openAssistantsDialog() },
+    { group: "Actions", label: "Afficher ou masquer la barre latérale", hint: "Ctrl+B", run: () => el.app.classList.toggle("sidebar-hidden") },
+    { group: "Actions", label: "Thème clair", keywords: "apparence light", run: () => setTheme("light") },
+    { group: "Actions", label: "Thème sombre", keywords: "apparence dark nuit", run: () => setTheme("dark") },
+    { group: "Actions", label: "Thème du système", keywords: "apparence automatique", run: () => setTheme("system") },
+  ];
+  if (state.current) {
+    actions.push(
+      { group: "Actions", label: "Réglages de cette conversation", keywords: "température contexte consignes raisonnement", run: () => el.convSettingsBtn.click() },
+      { group: "Actions", label: "Exporter la conversation en Markdown", run: () => el.exportBtn.click() },
+      { group: "Actions", label: "Compacter le contexte", keywords: "résumer historique", run: () => el.ctxMeter.click() },
+    );
+  }
+  if (o.kind === "code" && o.workspace) actions.push({ group: "Actions", label: "Panneau Git", hint: "Ctrl+G", keywords: "commit branche diff", run: () => toggleGitPanel() });
+
+  const items = actions.filter((a) => matches(q, `${a.label} ${a.keywords ?? ""}`));
+  const convs = state.convs.filter((c) => matches(q, c.title)).slice(0, q ? 8 : 6);
+  for (const c of convs) {
+    items.push({
+      group: q ? "Conversations" : "Conversations récentes",
+      label: c.title,
+      hint: [c.kind === "code" ? "Code" : "", state.runs.has(c.id) ? "en cours" : dayBucket(c.updatedAt)].filter(Boolean).join(" · "),
+      run: () => openConversation(c.id),
+    });
+  }
+  for (const v of state.settings.servers.filter((v) => v.id !== state.settings.activeServer && matches(q, `serveur ${v.name}`))) {
+    if (q) items.push({ group: "Serveurs", label: `Serveur : ${v.name}`, hint: "basculer", run: () => applyServers(state.settings.servers, v.id).catch((e) => toast(errMsg(e), true)) });
+  }
+  for (const a of assistants().filter((a) => matches(q, `assistant ${a.name} ${a.description}`))) {
+    if (q) items.push({ group: "Assistants", label: a.name, hint: a.model || "modèle par défaut", run: () => useAssistant(a) });
+  }
+  if (q) {
+    for (const m of state.models.filter((m) => matches(q, m.id)).slice(0, 6)) {
+      items.push({ group: "Modèles", label: m.id, hint: "utiliser pour cette conversation", run: () => pickModel(m.id) });
+    }
+    for (const p of projectList().filter((p) => matches(q, p.name)).slice(0, 5)) {
+      items.push({
+        group: "Projets",
+        label: p.name,
+        hint: "afficher le projet",
+        run: () => {
+          el.projectSelect.value = p.id;
+          el.projectSelect.dispatchEvent(new Event("change"));
+        },
+      });
+    }
+  }
+  return items;
+}
+
+/** Conversations dont le contenu (et pas seulement le titre) correspond à la requête. */
+async function paletteSearch(q: string): Promise<PaletteItem[]> {
+  const hits = await api.searchConversations(q.toLowerCase());
+  return hits.slice(0, 8).flatMap((h) => {
+    const c = state.convs.find((x) => x.id === h.id);
+    return c ? [{ group: "Conversations", label: c.title, hint: h.snippet ?? undefined, run: () => openConversation(c.id) }] : [];
+  });
+}
 
 // ---------------------------------------------------------------- démarrage
 
@@ -2331,11 +2992,100 @@ async function init() {
     onChange: onProjectChange,
     toast,
     onWorkspaceAdded: () => api.listWorkspaces().then((w) => (state.workspaces = w)).catch(() => {}),
+    readScanned: readScannedPdf,
+  });
+  initPreview({
+    toast,
+    onOpen: () => {
+      el.changesPanel.hidden = true;
+      toggleGitPanel(false);
+    },
   });
   initDictation({ input: el.input, toast });
-  initModelsUi({
+  initPopover();
+  // Boutons à icône seule : leur infobulle sert aussi de nom pour les lecteurs d'écran.
+  for (const b of document.querySelectorAll<HTMLElement>("button[title]:not([aria-label])")) {
+    if (!b.textContent?.trim()) b.setAttribute("aria-label", b.title);
+  }
+  initModelPicker({
+    button: el.modelBtn,
+    models: () => state.models,
+    loaded: () => state.loaded,
+    setLoaded: (names) => (state.loaded = names),
+    selected: () => state.selectedModel,
+    kind: () => opts().kind,
+    pick: pickModel,
+    manage: () => openModelsDialog(),
+    assistants,
+    pickAssistant: useAssistant,
+    manageAssistants: () => openAssistantsDialog(),
+    assistant: () => opts().assistant,
+  });
+  await loadAssistants();
+  initAssistantsUi({
     toast,
     models: () => state.models,
+    changed: () => {
+      if (!state.current) renderWelcome();
+    },
+    use: useAssistant,
+  });
+  initConvSettings({
+    button: el.convSettingsBtn,
+    settings: () => state.settings,
+    get: () => {
+      const o = opts();
+      const model = state.selectedModel;
+      return { systemPrompt: o.systemPrompt, params: o.params, thinkingModel: !!modelInfo(model)?.thinking, maxContext: modelInfo(model)?.maxContextLength ?? null };
+    },
+    set: (systemPrompt, params) => {
+      if (state.current) Object.assign(state.current, { systemPrompt, params });
+      else Object.assign(state.draft, { systemPrompt: systemPrompt ?? undefined, params });
+      if (state.current) saveCurrent();
+      renderChrome();
+    },
+  });
+  initPalette({ items: paletteItems, search: paletteSearch });
+  initServersUi({
+    toast,
+    settings: () => state.settings,
+    status: () => state.server,
+    running: () => state.running,
+    modelCount: () => state.models.length,
+    apply: async (servers, active) => {
+      await applyServers(servers, active);
+      // Réglages ouverts : les listes de modèles suivent le serveur testé.
+      if (el.settings.open) {
+        fillModelSelect(s.model, s.model.value, "Automatique (premier modèle installé)");
+        fillModelSelect(s.codeModel, s.codeModel.value, "Automatique (premier modèle gérant les outils)");
+      }
+    },
+    openSettings: () => openSettings(),
+    openModels: () => openModelsDialog(),
+    openSsh: () => openSshDialog(),
+    refreshRunning,
+  });
+  // Saisie rapide (raccourci global ou `--quick`) : la question part dans une nouvelle conversation.
+  listen<string>("quick-prompt", (e) => {
+    for (const d of document.querySelectorAll<HTMLDialogElement>("dialog[open]")) d.close();
+    state.mode = "chat";
+    newChat();
+    el.input.value = e.payload;
+    send();
+  });
+  initBackupUi({
+    toast,
+    settings: () => state.settings,
+    patch: async (p) => {
+      const next = { ...state.settings, ...p };
+      await api.saveSettings(next);
+      state.settings = next;
+    },
+    reload: () => location.reload(),
+  });
+  initModelsUi({
+    toast,
+    models: () => state.allModels,
     reload: loadModels,
     numCtx: contextFor,
     use: pickModel,
@@ -2343,7 +3093,7 @@ async function init() {
   initGitUi({
     workspace: () => (opts().kind === "code" ? opts().workspace : undefined),
     model: () => state.selectedModel || defaultModelFor("code"),
-    chatOptions,
+    chatOptions: (model, think) => chatOptions({ model }, think),
     toast,
     recordUsage: (model, p, c) => {
       api.recordUsage(today(), model, p, c).catch(() => {});
@@ -2363,7 +3113,9 @@ async function init() {
   await loadModels();
   // Ollama lancé après l'application : nouvelle tentative régulière tant qu'il est injoignable.
   window.setInterval(() => {
-    if (!connected() && !state.busy && !document.hidden) loadModels();
+    if (document.hidden) return;
+    if (!connected() && !state.runs.size) loadModels();
+    else refreshRunning();
   }, 15000);
   renderUsage();
   updaterSupported = await api.updaterSupported().catch(() => false);

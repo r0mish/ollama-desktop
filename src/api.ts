@@ -1,8 +1,22 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+export type Accent = "teal" | "blue" | "violet" | "rose" | "amber" | "graphite";
+
+export interface BackupStatus {
+  hasPassphrase: boolean;
+  last: number;
+}
+
+export interface RestoreSummary {
+  conversations: number;
+  projects: number;
+  others: number;
+}
+
 export interface Settings {
-  /** Serveur Ollama (local, réseau privé, ou distant en HTTPS). */
-  baseUrl: string;
+  /** Serveurs Ollama et identifiant de celui utilisé. */
+  servers: Server[];
+  activeServer: string;
   /** Vide = premier modèle installé. */
   defaultModel: string;
   systemPrompt: string;
@@ -36,6 +50,22 @@ export interface Settings {
   /** Termes à favoriser (un par ligne ou séparés par des virgules). */
   transcriptionVocabulary: string;
   encryptData: boolean;
+  /** Modèle d'embedding pour la recherche sémantique dans les projets (vide = mots-clés seuls). */
+  embeddingModel: string;
+  /** Modèle vision qui lit les PDF scannés (vide = désactivé). */
+  ocrModel: string;
+  /** L'accueil guidé a été terminé. */
+  onboarded: boolean;
+  /** Dossier des sauvegardes chiffrées (vide = aucune). */
+  backupDir: string;
+  backupAuto: boolean;
+  /** Nombre de sauvegardes conservées dans le dossier. */
+  backupKeep: number;
+  /** Date de la dernière sauvegarde (ms) ; tenue par l'application. */
+  lastBackup: number;
+  accent: Accent;
+  /** Raccourci global de la saisie rapide ; vide = aucun. */
+  quickShortcut: string;
   settingsVersion?: number;
 }
 
@@ -52,6 +82,10 @@ export interface ModelInfo {
   thinking: boolean;
   maxContextLength: number | null;
   remote: boolean;
+  /** Utilisable en chat. */
+  completion: boolean;
+  /** Modèle d'embedding (recherche sémantique). */
+  embedding: boolean;
 }
 
 export interface RunningModel {
@@ -62,8 +96,21 @@ export interface RunningModel {
   contextLength: number | null;
 }
 
-export interface ServerStatus {
+/** Un serveur Ollama : adresse directe, ou tunnel SSH vers un serveur SSH enregistré. */
+export interface Server {
+  id: string;
+  name: string;
   url: string;
+  sshHost: string | null;
+  remotePort: number | null;
+}
+
+export interface ServerStatus {
+  id: string;
+  name: string;
+  url: string;
+  /** Nom du serveur SSH quand la connexion passe par un tunnel. */
+  tunnel: string | null;
   version: string | null;
   error: string | null;
   /** HTTP en clair hors de cette machine. */
@@ -93,6 +140,14 @@ export interface ToolCallRec {
   diff?: string;
   /** Chemin absolu hors du dossier de projet (accès système). */
   outside?: string;
+  /** Fin de la sortie d'une commande en cours (affichage en direct, non conservé). */
+  live?: string;
+  /** La commande utilise sudo : mot de passe à demander, ou déjà retenu pour la session. */
+  sudo?: "ask" | "cached";
+  /** État du fichier avant la modification, tant qu'elle peut être annulée. */
+  undo?: { path: string; before: string | null };
+  /** Modification annulée par l'utilisateur. */
+  undone?: boolean;
 }
 
 export interface Message {
@@ -110,6 +165,16 @@ export interface Message {
   toolCalls?: ToolCallRec[];
   /** Relance envoyée automatiquement par l'application. */
   auto?: boolean;
+  /** Réponse d'un second modèle à la même question, affichée côte à côte. */
+  alt?: AltAnswer;
+}
+
+export interface AltAnswer {
+  model: string;
+  content: string;
+  reasoning?: string;
+  usage?: { promptTokens: number; completionTokens: number; tokensPerSec?: number | null };
+  error?: string;
 }
 
 export interface Compaction {
@@ -124,8 +189,26 @@ export interface Usage {
   completionTokens: number;
 }
 
+/** Réglages de génération propres à une conversation (champ absent = réglage global). */
+export interface ConvParams {
+  temperature?: number | null;
+  numCtx?: number | null;
+  think?: boolean | null;
+}
+
+/** Assistant personnalisé : un modèle, des consignes et des réglages réutilisables. */
+export interface Assistant {
+  id: string;
+  name: string;
+  description: string;
+  model: string;
+  systemPrompt: string;
+  params?: ConvParams;
+}
+
 export type Kind = "chat" | "code";
-export type PermissionMode = "ask" | "acceptEdits" | "auto";
+/** « plan » : lecture seule, l'agent propose un plan avant toute modification. */
+export type PermissionMode = "plan" | "ask" | "acceptEdits" | "auto";
 
 export interface Conversation {
   id: string;
@@ -135,6 +218,9 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   systemPrompt: string | null;
+  params?: ConvParams;
+  /** Nom de l'assistant appliqué, pour l'affichage. */
+  assistant?: string;
   messages: Message[];
   workspace?: string;
   permissionMode?: PermissionMode;
@@ -181,6 +267,8 @@ export interface SearchHit {
 export interface ProjectContext {
   mode: "full" | "excerpts";
   text: string;
+  /** « semantic », « keywords », ou la raison pour laquelle la recherche par le sens a échoué. */
+  search: string;
 }
 
 export interface VaultStatus {
@@ -237,6 +325,7 @@ export interface ToolOutput {
   content: string;
   isError: boolean;
   diff: string | null;
+  undo: { path: string; before: string | null } | null;
 }
 
 export interface McpServerStatus {
@@ -273,10 +362,21 @@ export interface SshTestResult {
   error: string | null;
   needsTrust: boolean;
   fingerprints: string[];
+  /** Aucune clé acceptée par le serveur. */
+  authFailed: boolean;
+  /** Méthodes acceptées par le serveur, si connues. */
+  authMethods: string[];
   system: string | null;
   user: string | null;
   home: string | null;
   git: string | null;
+}
+
+export interface SshConfigHost {
+  alias: string;
+  hostname: string | null;
+  user: string | null;
+  port: number | null;
 }
 
 export interface GitFile {
@@ -306,9 +406,11 @@ export interface GitCommit {
 export type UsageLog = Record<string, Record<string, [number, number, number]>>;
 
 export const api = {
-  keyStatus: () => invoke<KeyStatus>("api_key_status"),
-  setKey: (key: string) => invoke<void>("set_api_key", { key }),
-  deleteKey: () => invoke<void>("delete_api_key"),
+  keyStatus: (server: string) => invoke<KeyStatus>("api_key_status", { server }),
+  setKey: (server: string, key: string) => invoke<void>("set_api_key", { server, key }),
+  deleteKey: (server: string) => invoke<void>("delete_api_key", { server }),
+  listAssistants: () => invoke<Assistant[]>("list_assistants"),
+  saveAssistants: (assistants: Assistant[]) => invoke<void>("save_assistants", { assistants }),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
   serverStatus: () => invoke<ServerStatus>("server_status"),
@@ -328,6 +430,15 @@ export const api = {
   deleteConversation: (id: string) => invoke<void>("delete_conversation", { id }),
   exportConversation: (id: string) => invoke<boolean>("export_conversation", { id }),
   dataDir: () => invoke<string>("data_dir"),
+  /** Enregistre le raccourci global des réglages ; rejette avec la raison s'il est indisponible. */
+  quickApplyShortcut: () => invoke<void>("quick_apply_shortcut"),
+  backupStatus: () => invoke<BackupStatus>("backup_status"),
+  backupSetPassphrase: (passphrase: string) => invoke<void>("backup_set_passphrase", { passphrase }),
+  backupPickDir: () => invoke<string | null>("backup_pick_dir"),
+  /** Renvoie le chemin du fichier écrit. */
+  backupNow: () => invoke<string>("backup_now"),
+  /** `passphrase` vide = celle du trousseau. null = boîte de dialogue annulée. */
+  backupRestore: (passphrase: string) => invoke<RestoreSummary | null>("backup_restore", { passphrase }),
   cancel: (requestId: string) => invoke<void>("cancel_stream", { requestId }),
   platform: () =>
     invoke<{ os: string; shell: string; shellPath: string; shellGuidance: string; version: string }>("platform_info"),
@@ -341,6 +452,10 @@ export const api = {
   sshDeleteHost: (id: string) => invoke<void>("ssh_delete_host", { id }),
   sshTest: (host: SshHost) => invoke<SshTestResult>("ssh_test", { host }),
   sshTrust: (host: SshHost) => invoke<void>("ssh_trust", { host }),
+  sshInstallKey: (host: SshHost, password: string) =>
+    invoke<{ identityFile: string; already: boolean }>("ssh_install_key", { host, password }),
+  sshPublicKey: () => invoke<string>("ssh_public_key"),
+  sshConfigHosts: () => invoke<SshConfigHost[]>("ssh_config_hosts"),
   sshListDirs: (hostId: string, path: string) => invoke<{ path: string; dirs: string[] }>("ssh_list_dirs", { hostId, path }),
   sshOpenWorkspace: (hostId: string, path: string) => invoke<string>("ssh_open_workspace", { hostId, path }),
 
@@ -371,7 +486,11 @@ export const api = {
   dictationStop: (transcribe: boolean) => invoke<string | null>("dictation_stop", { transcribe }),
 
   searchConversations: (query: string) => invoke<SearchHit[]>("search_conversations", { query }),
-  projectContext: (id: string, query: string) => invoke<ProjectContext>("project_context", { id, query }),
+  projectContext(id: string, query: string, onProgress?: (done: number, total: number) => void): Promise<ProjectContext> {
+    const channel = new Channel<[number, number]>();
+    if (onProgress) channel.onmessage = ([done, total]) => onProgress(done, total);
+    return invoke<ProjectContext>("project_context", { id, query, onProgress: channel });
+  },
 
   vaultStatus: () => invoke<VaultStatus>("vault_status"),
   vaultExportKey: () => invoke<string>("vault_export_key"),
@@ -389,15 +508,32 @@ export const api = {
     invoke<string | null>("tool_outside", { ctx, name, arguments: args }),
   previewTool: (ctx: ToolContext, name: string, args: string) =>
     invoke<string | null>("preview_tool", { ctx, name, arguments: args }),
-  runTool: (requestId: string, ctx: ToolContext, name: string, args: string) =>
-    invoke<ToolOutput>("run_tool", { requestId, ctx, name, arguments: args }),
+  runTool(
+    requestId: string,
+    ctx: ToolContext,
+    name: string,
+    args: string,
+    opts: { sudoPassword?: string; onOutput?: (text: string) => void } = {},
+  ): Promise<ToolOutput> {
+    const channel = new Channel<string>();
+    if (opts.onOutput) channel.onmessage = opts.onOutput;
+    return invoke<ToolOutput>("run_tool", {
+      requestId,
+      ctx,
+      call: { name, arguments: args, sudoPassword: opts.sudoPassword ?? null },
+      onOutput: channel,
+    });
+  },
+  restoreFile: (ctx: ToolContext, path: string, before: string | null) => invoke<void>("restore_file", { ctx, path, before }),
 
   pickWorkspace: () => invoke<string | null>("pick_workspace"),
   listWorkspaces: () => invoke<string[]>("list_workspaces"),
   forgetWorkspace: (path: string) => invoke<string[]>("forget_workspace", { path }),
   touchWorkspace: (path: string) => invoke<void>("touch_workspace", { path }),
 
-  processDocument: (dataBase64: string) => invoke<{ text: string; method: "local" }>("process_document", { dataBase64 }),
+  processDocument: (dataBase64: string) => invoke<{ text: string; method: "local"; scanned: boolean }>("process_document", { dataBase64 }),
+  /** Images des pages d'un PDF scanné (data URL), à faire lire par un modèle vision. */
+  pdfPageImages: (dataBase64: string) => invoke<{ images: string[]; pages: number; skipped: number }>("pdf_page_images", { dataBase64 }),
 
   mcpGetConfig: () => invoke<string>("mcp_get_config"),
   mcpSaveConfig: (text: string) => invoke<void>("mcp_save_config", { text }),

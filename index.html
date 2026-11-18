@@ -28,10 +28,14 @@
             <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
             <span id="new-chat-label">Nouvelle conversation</span>
           </button>
-          <input id="search" type="search" placeholder="Rechercher…" autocomplete="off" />
+          <input id="search" type="search" placeholder="Rechercher…" autocomplete="off" title="Rechercher dans les conversations · Ctrl+K : palette de commandes" />
         </div>
         <nav id="conv-list"></nav>
         <div class="sidebar-bottom">
+          <button type="button" id="server-chip" class="server-chip" data-state="connecting">
+            <i class="sc-dot"></i><span class="sc-text"><strong class="sc-name">Ollama</strong><small class="sc-detail">connexion…</small></span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg>
+          </button>
           <button id="open-settings" class="btn-ghost" title="Réglages (Ctrl+,)">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
             Réglages
@@ -58,13 +62,23 @@
             <svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M6 8.5v7M18 10.5c0 4-6 3-10.5 6" /></svg>
             <span>git</span>
           </button>
+          <button id="changes-btn" class="chip-btn changes-btn" title="Fichiers modifiés par l'agent dans cette session" hidden>
+            <svg viewBox="0 0 24 24"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
+            <span></span>
+          </button>
           <select id="perm-select" title="Permissions de l'agent" hidden>
+            <option value="plan">Plan (lecture seule)</option>
             <option value="ask">Tout demander</option>
             <option value="acceptEdits">Modifs auto</option>
             <option value="auto">Autonome</option>
           </select>
           <select id="conv-project" title="Projet de la conversation" hidden></select>
-          <select id="model-select" title="Modèle"></select>
+          <button type="button" id="model-btn" class="model-btn">
+            <span></span><svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+          <button type="button" id="conv-settings-btn" class="icon-btn" title="Réglages de cette conversation">
+            <svg viewBox="0 0 24 24"><path d="M4 6h8M16 6h4M4 12h3M11 12h9M4 18h10M18 18h2" /><circle cx="14" cy="6" r="2" /><circle cx="9" cy="12" r="2" /><circle cx="16" cy="18" r="2" /></svg>
+          </button>
           <button id="models-btn" class="icon-btn" title="Gérer les modèles Ollama (Ctrl+M)">
             <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /><path d="M3.3 7 12 12l8.7-5M12 22V12" /></svg>
           </button>
@@ -76,7 +90,7 @@
         <section id="messages" aria-live="polite"></section>
 
         <footer id="composer-wrap">
-          <div id="activity" class="activity" hidden></div>
+          <div id="activity" class="activity" role="status" hidden></div>
           <div id="ws-menu" class="ws-menu" hidden></div>
           <form id="composer">
             <div id="attachments"></div>
@@ -117,6 +131,31 @@
         </footer>
         <div id="drop-overlay" hidden>Déposez vos fichiers ici</div>
 
+        <aside id="preview-panel" class="side-panel" hidden>
+          <header class="git-head">
+            <strong id="preview-title"></strong>
+            <span class="spacer"></span>
+            <div class="seg" id="preview-tabs">
+              <button type="button" data-view="render" class="active">Aperçu</button>
+              <button type="button" data-view="source">Source</button>
+            </div>
+            <button type="button" class="btn-ghost sm" id="preview-copy">Copier</button>
+            <button type="button" class="icon-btn sm" id="preview-close" title="Fermer">×</button>
+          </header>
+          <p class="muted small" id="preview-note" hidden>Rendu isolé : les scripts et les ressources distantes (images, polices) sont désactivés.</p>
+          <div id="preview-body"></div>
+        </aside>
+
+        <aside id="changes-panel" class="side-panel" hidden>
+          <header class="git-head">
+            <strong>Fichiers modifiés</strong>
+            <span class="spacer"></span>
+            <button type="button" class="icon-btn sm" id="changes-close" title="Fermer">×</button>
+          </header>
+          <div id="changes-list"></div>
+          <div id="changes-diff"></div>
+        </aside>
+
         <aside id="git-panel" hidden>
           <header class="git-head">
             <strong>Git</strong>
@@ -149,7 +188,7 @@
     </div>
 
     <dialog id="settings">
-      <form id="settings-form" method="dialog">
+      <form id="settings-form" method="dialog" novalidate>
         <div class="settings-head">
           <h2>Réglages</h2>
           <nav class="settings-tabs">
@@ -163,23 +202,51 @@
 
         <div class="tab" data-tab="general">
           <fieldset>
-            <legend>Serveur Ollama</legend>
+            <legend>Serveurs Ollama</legend>
+            <div id="srv-list"></div>
             <div class="row">
-              <input id="s-base" type="url" placeholder="http://localhost:11434" spellcheck="false" />
-              <button type="button" id="test-server" class="btn-ghost">Tester</button>
+              <button type="button" id="srv-add" class="btn-ghost sm">+ Ajouter un serveur</button>
+              <span class="spacer"></span>
+              <button type="button" id="test-server" class="btn-ghost sm">Tester le serveur choisi</button>
             </div>
             <p class="muted small" id="server-status"></p>
-            <p class="muted small">Local (<code>localhost</code>), machine du réseau privé (<code>http://192.168.1.20:11434</code>, <code>http://gpu.lan:11434</code>, Tailscale…) ou serveur distant en HTTPS. Sur une autre machine, lancez Ollama avec <code>OLLAMA_HOST=0.0.0.0</code> et filtrez le port 11434 au pare-feu.</p>
-            <details>
-              <summary class="small">Clé API (facultatif : Ollama derrière un proxy authentifiant)</summary>
-              <p class="muted small" id="key-status"></p>
-              <div class="row">
-                <input id="api-key" type="password" placeholder="Jeton envoyé en en-tête Authorization: Bearer" autocomplete="off" spellcheck="false" />
-                <button type="button" id="save-key" class="btn-primary">Enregistrer</button>
-                <button type="button" id="delete-key" class="btn-ghost danger">Supprimer</button>
+            <div id="srv-form" hidden>
+              <div class="grid2">
+                <label>Nom <input id="srv-name" placeholder="Ex. : PC fixe, Serveur GPU" maxlength="40" /></label>
+                <label>Connexion
+                  <select id="srv-kind">
+                    <option value="direct">Adresse directe</option>
+                    <option value="ssh">Tunnel SSH</option>
+                  </select>
+                </label>
               </div>
-              <p class="muted small">Stockée dans le trousseau du système (Keychain, Credential Manager, Secret Service), jamais en clair sur le disque. Repli : variable <code>OLLAMA_API_KEY</code>.</p>
-            </details>
+              <div id="srv-direct">
+                <label>Adresse <input id="srv-url" type="url" placeholder="http://localhost:11434" spellcheck="false" /></label>
+                <p class="muted small">Local (<code>localhost</code>), réseau privé (<code>http://192.168.1.20:11434</code>, <code>http://gpu.lan:11434</code>, Tailscale…) ou distant en HTTPS. Sur une autre machine, Ollama doit écouter sur le réseau (<code>OLLAMA_HOST=0.0.0.0</code>) : préférez un tunnel SSH pour ne pas exposer le port.</p>
+              </div>
+              <div id="srv-tunnel" hidden>
+                <div class="grid2">
+                  <label>Serveur SSH <select id="srv-ssh"></select></label>
+                  <label>Port d'Ollama sur le serveur <input id="srv-port" type="number" min="1" max="65535" placeholder="11434" /></label>
+                </div>
+                <p class="muted small">Ollama reste en écoute sur <code>127.0.0.1</code> côté serveur : rien n'est exposé au réseau, tout passe par SSH (chiffré, avec vos clés).
+                  <button type="button" class="btn-ghost sm" id="srv-open-ssh">Serveurs SSH…</button></p>
+              </div>
+              <details>
+                <summary class="small">Clé API (facultatif : Ollama derrière un proxy authentifiant)</summary>
+                <p class="muted small" id="key-status"></p>
+                <div class="row">
+                  <input id="api-key" type="password" placeholder="Jeton envoyé en en-tête Authorization: Bearer" autocomplete="off" spellcheck="false" />
+                  <button type="button" id="save-key" class="btn-primary sm">Enregistrer</button>
+                  <button type="button" id="delete-key" class="btn-ghost sm danger">Supprimer</button>
+                </div>
+                <p class="muted small">Stockée dans le trousseau du système, jamais en clair sur le disque. Repli : variable <code>OLLAMA_API_KEY</code>.</p>
+              </details>
+              <div class="row end">
+                <button type="button" id="srv-cancel" class="btn-ghost sm">Annuler</button>
+                <button type="button" id="srv-ok" class="btn-primary sm">Valider</button>
+              </div>
+            </div>
           </fieldset>
 
           <fieldset>
@@ -222,6 +289,25 @@
               </label>
               <label class="check"><input id="s-enter" type="checkbox" /> Entrée pour envoyer (Maj+Entrée = retour ligne)</label>
             </div>
+            <label>Raccourci global de saisie rapide
+              <select id="s-quick">
+                <option value="">Désactivé</option>
+                <option value="CmdOrCtrl+Shift+Space">Ctrl + Maj + Espace</option>
+                <option value="CmdOrCtrl+Alt+Space">Ctrl + Alt + Espace</option>
+                <option value="Alt+Space">Alt + Espace</option>
+                <option value="Super+Shift+O">Super + Maj + O</option>
+              </select>
+              <small class="muted" id="s-quick-hint">Depuis n'importe quelle application, ouvre un champ de saisie : la question part dans une nouvelle conversation.</small>
+            </label>
+            <div class="accent-row" role="radiogroup" aria-label="Couleur d'accent">
+              <span class="muted small">Couleur d'accent</span>
+              <label class="swatch" data-accent="teal" title="Sarcelle"><input type="radio" name="accent" value="teal" aria-label="Sarcelle" /><span></span></label>
+              <label class="swatch" data-accent="blue" title="Bleu"><input type="radio" name="accent" value="blue" aria-label="Bleu" /><span></span></label>
+              <label class="swatch" data-accent="violet" title="Violet"><input type="radio" name="accent" value="violet" aria-label="Violet" /><span></span></label>
+              <label class="swatch" data-accent="rose" title="Rose"><input type="radio" name="accent" value="rose" aria-label="Rose" /><span></span></label>
+              <label class="swatch" data-accent="amber" title="Ambre"><input type="radio" name="accent" value="amber" aria-label="Ambre" /><span></span></label>
+              <label class="swatch" data-accent="graphite" title="Graphite"><input type="radio" name="accent" value="graphite" aria-label="Graphite" /><span></span></label>
+            </div>
           </fieldset>
 
           <fieldset>
@@ -237,6 +323,36 @@
               <input id="vault-key" spellcheck="false" autocomplete="off" class="mono" />
               <button type="button" id="vault-key-action" class="btn-primary sm">Copier</button>
             </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Sauvegarde</legend>
+            <p class="muted small">Copie chiffrée des conversations, projets, assistants et réglages dans un dossier de votre choix : dossier synchronisé (Nextcloud, Syncthing…), partage réseau ou disque externe. Les clés API et les mots de passe n'y figurent jamais.</p>
+            <label>Dossier des sauvegardes
+              <div class="row">
+                <input id="s-backup-dir" readonly placeholder="Aucun dossier choisi" />
+                <button type="button" id="backup-pick" class="btn-ghost sm">Choisir…</button>
+              </div>
+            </label>
+            <label>Phrase secrète
+              <div class="row">
+                <input id="backup-pass" type="password" autocomplete="new-password" spellcheck="false" placeholder="8 caractères au moins" />
+                <button type="button" id="backup-pass-save" class="btn-ghost sm">Enregistrer</button>
+              </div>
+              <small class="muted" id="backup-pass-status"></small>
+            </label>
+            <div class="grid2">
+              <label class="check"><input id="s-backup-auto" type="checkbox" /> Sauvegarde automatique, une fois par jour au démarrage</label>
+              <label>Sauvegardes conservées
+                <input id="s-backup-keep" type="number" min="1" max="365" step="1" />
+              </label>
+            </div>
+            <div class="row">
+              <button type="button" id="backup-now" class="btn-ghost sm">Sauvegarder maintenant</button>
+              <button type="button" id="backup-restore" class="btn-ghost sm">Restaurer une sauvegarde…</button>
+              <span class="muted small" id="backup-status"></span>
+            </div>
+            <p class="muted small">Chiffrement XChaCha20-Poly1305, clé dérivée de la phrase secrète par Argon2id. La phrase est gardée dans le trousseau du système, jamais dans le dossier : sans elle, une sauvegarde est illisible. Notez-la dans votre gestionnaire de mots de passe.</p>
           </fieldset>
 
           <fieldset>
@@ -292,8 +408,19 @@
             <p class="muted small">Ollama ne transcrit pas l'audio : indiquez un serveur auto-hébergé compatible <code>/v1/audio/transcriptions</code> (<a href="https://speaches.ai" data-external>Speaches</a>/faster-whisper, whisper.cpp <code>server</code>, Voxtral via vLLM…). Le son est capté en mémoire uniquement, jamais écrit sur le disque.</p>
           </fieldset>
           <fieldset>
+            <legend>Recherche dans les projets</legend>
+            <label>Modèle d'embedding (recherche par le sens)
+              <input id="s-embed" list="embed-models" placeholder="vide = recherche par mots-clés uniquement" spellcheck="false" />
+              <datalist id="embed-models"></datalist>
+            </label>
+            <p class="muted small">Pour les gros projets (plus de 60 000 caractères de fichiers de référence), seuls les passages utiles sont envoyés au modèle. Avec un modèle d'embedding installé sur votre serveur Ollama (<code>bge-m3</code>, multilingue ; <code>nomic-embed-text</code>, <code>embeddinggemma</code>), la recherche comprend aussi les synonymes et les reformulations, en plus des mots-clés. L'index est calculé une fois par votre serveur et gardé chiffré sur cet appareil.</p>
+          </fieldset>
+          <fieldset>
             <legend>Documents PDF</legend>
-            <p class="muted small">Le texte des PDF est extrait localement, rien n'est envoyé ailleurs qu'à votre serveur Ollama. Pour un PDF scanné, joignez des captures des pages à un modèle vision.</p>
+            <label>Modèle vision pour les PDF scannés
+              <select id="s-ocr"></select>
+            </label>
+            <p class="muted small">Le texte des PDF est extrait localement. Un PDF scanné (sans texte) est lu page par page par le modèle vision choisi, sur votre serveur Ollama : comptez quelques secondes par page.</p>
           </fieldset>
         </div>
 
@@ -384,15 +511,16 @@
             <h2 id="ssh-title">Nouveau serveur</h2>
             <button type="button" class="icon-btn" id="ssh-close" title="Fermer">×</button>
           </div>
+          <div id="ssh-suggest" hidden></div>
           <form id="ssh-form" autocomplete="off">
             <div class="grid2">
               <label>Nom affiché <input id="ssh-label" placeholder="Serveur web prod" /></label>
-              <label>Hôte <input id="ssh-host" placeholder="alias ~/.ssh/config, nom ou IP" spellcheck="false" required /></label>
+              <label>Hôte <input id="ssh-host" placeholder="nom, IP, alias, ou user@hôte:port" spellcheck="false" required /></label>
               <label>Utilisateur <input id="ssh-user" placeholder="par défaut : config SSH" spellcheck="false" /></label>
               <label>Port <input id="ssh-port" type="number" min="1" max="65535" placeholder="22" /></label>
             </div>
             <label>Clé privée (facultatif) <input id="ssh-key" placeholder="~/.ssh/id_ed25519 — sinon agent SSH" spellcheck="false" /></label>
-            <p class="muted small">Utilise le client OpenSSH du système : vos alias, <code>ProxyJump</code> et clés de <code>~/.ssh/config</code> s'appliquent. Authentification par clé ou agent SSH uniquement (pas de mot de passe).</p>
+            <p class="muted small">Utilise le client OpenSSH du système : vos alias, <code>ProxyJump</code> et clés de <code>~/.ssh/config</code> s'appliquent. Pas encore de clé sur le serveur ? Cliquez sur « Se connecter » : l'application propose de l'installer avec votre mot de passe, demandé une seule fois et jamais enregistré.</p>
             <div class="row end">
               <button type="button" class="btn-ghost sm danger" id="ssh-delete" hidden>Supprimer</button>
               <button type="submit" class="btn-primary sm" id="ssh-test">Se connecter</button>
@@ -478,6 +606,58 @@
       </div>
     </dialog>
 
-    <div id="toast" hidden></div>
+    <dialog id="assistants-dialog">
+      <div class="ssh-layout">
+        <aside class="ssh-hosts">
+          <div class="group">Assistants</div>
+          <div id="as-list"></div>
+          <button type="button" class="btn-ghost sm" id="as-new">+ Nouvel assistant</button>
+        </aside>
+        <section class="ssh-main">
+          <div class="settings-head">
+            <h2 id="as-title">Nouvel assistant</h2>
+            <button type="button" class="icon-btn" id="as-close" title="Fermer">×</button>
+          </div>
+          <form id="as-form" autocomplete="off">
+            <div class="grid2">
+              <label>Nom <input id="as-name" maxlength="40" placeholder="Ex. : Relecteur, Admin Linux" /></label>
+              <label>Modèle <select id="as-model"></select></label>
+            </div>
+            <label>Description (facultatif) <input id="as-desc" maxlength="120" placeholder="Ex. : corrige et reformule mes textes en français" /></label>
+            <label>Instructions système
+              <textarea id="as-system" rows="6" placeholder="Ex. : Tu es administrateur système Linux. Réponds en français, avec des commandes prêtes à copier et les risques éventuels."></textarea>
+            </label>
+            <div class="grid3">
+              <label>Température <input id="as-temp" type="number" min="0" max="2" step="0.1" placeholder="globale" /></label>
+              <label>Contexte
+                <select id="as-ctx">
+                  <option value="">Global</option>
+                  <option value="4096">4 k</option><option value="8192">8 k</option><option value="16384">16 k</option>
+                  <option value="32768">32 k</option><option value="65536">64 k</option><option value="131072">128 k</option>
+                </select>
+              </label>
+              <label>Raisonnement
+                <select id="as-think"><option value="">Global</option><option value="on">Activé</option><option value="off">Désactivé</option></select>
+              </label>
+            </div>
+            <p class="muted small">Un assistant préremplit le modèle, les consignes et les réglages d'une conversation. Stocké uniquement sur cet appareil.</p>
+            <div class="row end">
+              <button type="button" class="btn-ghost sm danger" id="as-delete" hidden>Supprimer</button>
+              <button type="submit" class="btn-ghost sm">Enregistrer</button>
+              <button type="button" class="btn-primary sm" id="as-use" hidden>Utiliser</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="palette">
+      <input id="palette-input" placeholder="Rechercher une action, une conversation, un modèle…" autocomplete="off" spellcheck="false" />
+      <div id="palette-list"></div>
+      <div class="pal-foot"><span><kbd>↑</kbd><kbd>↓</kbd> naviguer</span><span><kbd>Entrée</kbd> ouvrir</span><span><kbd>Échap</kbd> fermer</span></div>
+    </dialog>
+
+    <div id="popover" class="popover" hidden></div>
+    <div id="toast" role="status" aria-live="polite" hidden></div>
   </body>
 </html>

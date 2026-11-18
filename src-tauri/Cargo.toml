@@ -1,6 +1,6 @@
 [package]
 name = "ollama-desktop"
-version = "0.1.0"
+version = "0.7.0"
 description = "Client de bureau léger et respectueux de la vie privée pour Ollama"
 authors = ["r0mish"]
 license = "MIT"
@@ -22,7 +22,7 @@ tauri-plugin-updater = { version = "2", default-features = false, features = ["r
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "http2", "charset", "multipart"] }
-tokio = { version = "1", features = ["sync", "macros", "process", "io-util", "time", "rt"] }
+tokio = { version = "1", features = ["sync", "macros", "process", "io-util", "time", "rt", "net"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
@@ -32,8 +32,16 @@ similar = "2"
 ignore = "0.4"
 regex = "1"
 pdf-extract = "0.12"
+# Déjà présents dans l'arbre de dépendances (pdf-extract, tauri) : PDF scannés.
+lopdf = { version = "0.42", default-features = false }
+png = "0.18"
 cpal = "0.18"
 chacha20poly1305 = "0.10"
+# Sauvegarde chiffrée : dérivation de clé depuis une phrase secrète, compression.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+flate2 = "1"
+# Saisie rapide : raccourci global.
+tauri-plugin-global-shortcut = "2"
 
 [dev-dependencies]
 # Faux serveur Ollama des tests d'intégration du client HTTP.

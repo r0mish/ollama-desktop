@@ -366,18 +366,67 @@ impl Target {
         }
     }
 
-    pub async fn run_command(&self, shell: &crate::shell::Shell, command: &str, timeout_secs: u64, cancel: Arc<Notify>) -> R<String> {
+    pub async fn run_command(
+        &self,
+        shell: &crate::shell::Shell,
+        command: &str,
+        timeout_secs: u64,
+        cancel: Arc<Notify>,
+        opts: workspace::RunOpts,
+    ) -> R<String> {
         match self {
-            Target::Local(r) => workspace::run_command(r, shell, command, timeout_secs, cancel).await,
+            Target::Local(r) => workspace::run_command(r, shell, command, timeout_secs, cancel, opts).await,
             Target::Remote { host, .. } => {
+                // sudo : validé par le mot de passe lu sur l'entrée standard, dans le shell qui
+                // exécute ensuite la commande (même PID après `exec`, donc même session sudo).
                 let script = format!(
-                    "cd -- {} || exit 1\nexport CI=1 NO_COLOR=1 GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\n\
+                    "{sudo}cd -- {} || exit 1\nexport CI=1 NO_COLOR=1 GIT_PAGER=cat PAGER=cat GIT_TERMINAL_PROMPT=0\n\
                      if command -v bash >/dev/null 2>&1; then exec bash -c {c}; else exec sh -c {c}; fi",
                     self.root_q(),
-                    c = quote(command)
+                    c = quote(command),
+                    sudo = if opts.sudo.is_some() { workspace::SUDO_PREAMBLE } else { "" },
                 );
-                let o = ssh::exec(host, &script, None, Duration::from_secs(timeout_secs.clamp(1, 3600)), Some(cancel)).await?;
+                let stdin = opts.sudo.as_ref().map(|p| format!("{p}\n").into_bytes());
+                let timeout = Duration::from_secs(timeout_secs.clamp(1, 3600));
+                let o = ssh::exec_live(host, &script, stdin, timeout, Some(cancel), opts.live).await?;
                 Ok(workspace::format_output(o.code, &o.stdout, &o.stderr))
+            }
+        }
+    }
+
+    /// Texte d'un fichier avant modification, pour pouvoir l'annuler : `None` s'il n'existe pas.
+    /// Erreur si le fichier est binaire ou trop volumineux (l'annulation est alors indisponible).
+    pub async fn snapshot(&self, rel: &str) -> R<Option<String>> {
+        const MAX: usize = 1024 * 1024;
+        let bytes = match self {
+            Target::Local(r) => {
+                let p = workspace::resolve(r, rel)?;
+                match std::fs::read(&p) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Target::Remote { .. } => self.cat(rel).await?,
+        };
+        match bytes {
+            None => Ok(None),
+            Some(b) if b.len() > MAX => Err("fichier trop volumineux".into()),
+            Some(b) => String::from_utf8(b).map(Some).map_err(|_| "fichier binaire".into()),
+        }
+    }
+
+    /// Supprime un fichier créé par l'agent (annulation d'une création).
+    pub async fn remove_file(&self, rel: &str) -> R<()> {
+        match self {
+            Target::Local(r) => std::fs::remove_file(workspace::resolve(r, rel)?).map_err(|e| e.to_string()),
+            Target::Remote { .. } => {
+                let o = self.sh(&format!("rm -f -- {}", quote(&self.rpath(rel)?)), None).await?;
+                if o.code == Some(0) {
+                    Ok(())
+                } else {
+                    Err(format!("{rel} : {}", o.stderr.trim()))
+                }
             }
         }
     }
@@ -533,9 +582,9 @@ mod ssh_integration {
 
         // 4. Commandes (bash, code de sortie, dossier courant).
         let sh = crate::shell::detect("auto");
-        let out = t.run_command(&sh, "pwd && [[ 1 -eq 1 ]] && echo bash-ok", 30, Arc::new(Notify::new())).await.unwrap();
+        let out = t.run_command(&sh, "pwd && [[ 1 -eq 1 ]] && echo bash-ok", 30, Arc::new(Notify::new()), Default::default()).await.unwrap();
         assert!(out.contains("Code de sortie : 0") && out.contains("bash-ok") && out.contains(&root), "{out}");
-        let out = t.run_command(&sh, "exit 7", 30, Arc::new(Notify::new())).await.unwrap();
+        let out = t.run_command(&sh, "exit 7", 30, Arc::new(Notify::new()), Default::default()).await.unwrap();
         assert!(out.contains("Code de sortie : 7"), "{out}");
 
         // 5. Annulation : le processus distant est tué.
@@ -545,7 +594,7 @@ mod ssh_integration {
             tokio::time::sleep(Duration::from_secs(2)).await;
             c2.notify_one();
         });
-        let err = t.run_command(&sh, "sleep 300 # md-cancel-marker", 60, cancel).await.unwrap_err();
+        let err = t.run_command(&sh, "sleep 300 # md-cancel-marker", 60, cancel, Default::default()).await.unwrap_err();
         assert!(err.contains("annulée"));
         let ps = ssh::exec(&h, "ps -eo args | grep -c '[m]d-cancel-marker' || true", None, Duration::from_secs(20), None).await.unwrap();
         let detail = ssh::exec(&h, "ps -eo pid,pgid,stat,args | grep '[m]d-cancel-marker' || true", None, Duration::from_secs(20), None).await.unwrap();
@@ -563,7 +612,7 @@ mod ssh_integration {
         // 7. Git distant.
         assert!(!crate::git::status(&t).await.unwrap().is_repo);
         crate::git::init(&t).await.unwrap();
-        t.run_command(&sh, "git config user.name T && git config user.email t@e.org", 30, Arc::new(Notify::new())).await.unwrap();
+        t.run_command(&sh, "git config user.name T && git config user.email t@e.org", 30, Arc::new(Notify::new()), Default::default()).await.unwrap();
         crate::git::stage(&t, &[]).await.unwrap();
         assert!(crate::git::commit(&t, "init distant").await.unwrap().contains("init distant"));
         t.write_file("src/main.py", "print('modifié')\n").await.unwrap();
@@ -571,6 +620,43 @@ mod ssh_integration {
         assert_eq!(st.files.len(), 1);
         assert!(crate::git::diff(&t, Some("src/main.py"), false, false).await.unwrap().contains("+print('modifié')"));
         assert_eq!(crate::git::log(&t, 5).await.unwrap().len(), 1);
+
+        // 6. Annulation d'une modification : contenu précédent restauré, fichier créé supprimé.
+        t.write_file("undo.txt", "avant\n").await.unwrap();
+        let before = t.snapshot("undo.txt").await.unwrap();
+        t.edit_file("undo.txt", "avant", "après", false).await.unwrap();
+        t.write_file("undo.txt", before.as_deref().unwrap()).await.unwrap();
+        assert_eq!(t.snapshot("undo.txt").await.unwrap().as_deref(), Some("avant\n"));
+        assert_eq!(t.snapshot("nouveau.txt").await.unwrap(), None);
+        t.write_file("nouveau.txt", "x").await.unwrap();
+        t.remove_file("nouveau.txt").await.unwrap();
+        assert_eq!(t.snapshot("nouveau.txt").await.unwrap(), None);
+
+        // 7. Sortie en direct et sudo par mot de passe (MD_SSH_TEST_SUDO_PASSWORD).
+        let got = Arc::new(std::sync::Mutex::new(String::new()));
+        let live_got = got.clone();
+        let live: workspace::Live = Arc::new(move |t| live_got.lock().unwrap().push_str(&t));
+        let opts = workspace::RunOpts { live: Some(live.clone()), sudo: None };
+        let out = t.run_command(&sh, "echo direct; echo erreur >&2", 30, Arc::new(Notify::new()), opts).await.unwrap();
+        assert!(out.contains("direct"));
+        let seen = got.lock().unwrap().clone();
+        assert!(seen.contains("direct") && seen.contains("erreur") && !seen.contains("__MDPID__"), "{seen:?}");
+        if let Ok(password) = std::env::var("MD_SSH_TEST_SUDO_PASSWORD") {
+            let (t, sh) = (&t, &sh);
+            let run = |cmd: &'static str, sudo: Option<String>| async move {
+                t.run_command(sh, cmd, 30, Arc::new(Notify::new()), workspace::RunOpts { live: None, sudo }).await.unwrap()
+            };
+            // Sans mot de passe : sudo échoue faute de terminal. Avec : la commande passe root.
+            let denied = run("sudo -k; sudo id -u", None).await;
+            assert!(!denied.starts_with("Code de sortie : 0"), "{denied}");
+            let ok = run("sudo id -u && echo après", Some(password.clone())).await;
+            assert!(ok.starts_with("Code de sortie : 0") && ok.contains("\n0\n") && ok.contains("après"), "{ok}");
+            // La commande ne peut pas lire le mot de passe : ni l'entrée standard, ni l'environnement.
+            let leak = run("cat; env; cat /proc/$$/environ | tr '\\0' '\\n'", Some(password.clone())).await;
+            assert!(!leak.contains(&password), "le mot de passe a fuité");
+            let wrong = run("sudo -k; sudo id -u", Some("faux-mot-de-passe".into())).await;
+            assert!(wrong.contains("mot de passe refusé"), "{wrong}");
+        }
 
         ssh::exec(&h, &format!("rm -rf {}", quote(&root)), None, Duration::from_secs(20), None).await.unwrap();
     }

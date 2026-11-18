@@ -64,7 +64,10 @@ const readAsBase64 = (f: Blob) =>
 async function readFile(file: File): Promise<ProjectFile> {
   if (file.type === "application/pdf" || /\.pdf$/i.test(file.name)) {
     if (file.size > MAX_PDF) throw new Error(`trop volumineux (max ${MAX_PDF / 1048576} Mo)`);
-    const { text } = await api.processDocument(await readAsBase64(file));
+    const b64 = await readAsBase64(file);
+    const res = await api.processDocument(b64);
+    // PDF scanné : lu page par page par le modèle vision des réglages.
+    const text = res.scanned ? await readScanned(file.name, b64, () => {}) : res.text;
     if (!text.trim()) throw new Error("aucun texte extrait");
     return { name: file.name, text };
   }
@@ -118,6 +121,7 @@ function setWorkspace(ws: string | null) {
   onWorkspaceAdded();
 }
 
+let readScanned: (name: string, dataBase64: string, progress: (page: number, pages: number) => void) => Promise<string> = async () => "";
 let onWorkspaceAdded: () => void = () => {};
 
 export function openProjectDialog(p: Project | null, defaults: Partial<Project> = {}) {
@@ -144,8 +148,11 @@ export function initProjectsUi(opts: {
   toast: (msg: string, error?: boolean) => void;
   /** Un dossier vient d'être autorisé (liste des dossiers à rafraîchir). */
   onWorkspaceAdded: () => void;
+  /** Transcrit un PDF scanné avec le modèle vision configuré. */
+  readScanned: (name: string, dataBase64: string, progress: (page: number, pages: number) => void) => Promise<string>;
 }) {
   onChange = opts.onChange;
+  readScanned = opts.readScanned;
   notify = opts.toast;
   onWorkspaceAdded = opts.onWorkspaceAdded;
   $("#p-ws-local").addEventListener("click", async () => {

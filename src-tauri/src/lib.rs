@@ -1,7 +1,11 @@
 mod audio;
+mod backup;
+mod embed;
 mod git;
 mod mcp;
 mod ollama;
+mod pdfscan;
+mod quick;
 mod shell;
 mod ssh;
 mod storage;
@@ -9,6 +13,7 @@ mod knowledge;
 mod target;
 mod textsearch;
 mod tools;
+mod tunnel;
 mod updates;
 mod vault;
 mod web;
@@ -41,14 +46,16 @@ struct Streams(Mutex<HashMap<String, Arc<Notify>>>);
 
 type CmdResult<T> = Result<T, String>;
 
-fn keyring_entry() -> CmdResult<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.to_string())
+/// Entrée du trousseau pour la clé API d'un serveur Ollama.
+fn keyring_entry(server: &str) -> CmdResult<keyring::Entry> {
+    let user = if server.is_empty() || server == "default" { KEYRING_USER.to_string() } else { format!("{KEYRING_USER}:{server}") };
+    keyring::Entry::new(KEYRING_SERVICE, &user).map_err(|e| e.to_string())
 }
 
 /// Clé API facultative (Ollama derrière un proxy authentifiant, ollama.com) : trousseau du
 /// système d'abord, variable d'environnement en repli. Vide = aucune authentification.
-fn api_key() -> String {
-    if let Ok(key) = keyring_entry().and_then(|e| e.get_password().map_err(|e| e.to_string())) {
+fn api_key(server: &str) -> String {
+    if let Ok(key) = keyring_entry(server).and_then(|e| e.get_password().map_err(|e| e.to_string())) {
         if !key.is_empty() {
             return key;
         }
@@ -56,9 +63,27 @@ fn api_key() -> String {
     std::env::var(ENV_API_KEY).unwrap_or_default()
 }
 
-/// URL du serveur et clé API.
-fn server(app: &AppHandle) -> CmdResult<(Settings, String)> {
-    Ok((storage::load_settings(app)?, api_key()))
+/// Connexion au serveur Ollama actif : adresse (celle du tunnel SSH le cas échéant) et clé API.
+struct Conn {
+    settings: Settings,
+    server: storage::Server,
+    base: String,
+    key: String,
+}
+
+async fn conn(app: &AppHandle, tunnels: &tunnel::Tunnels) -> CmdResult<Conn> {
+    let settings = storage::load_settings(app)?;
+    let server = settings.active();
+    let base = match &server.ssh_host {
+        Some(host_id) => {
+            let host = find_host(app, host_id).map_err(|_| format!("Le serveur SSH du tunnel « {} » n'existe plus : corrigez-le dans les réglages.", server.name))?;
+            let port = tunnels.ensure(&server.id, &host, server.remote_port.unwrap_or(11434)).await?;
+            format!("http://127.0.0.1:{port}")
+        }
+        None => server.url.trim().to_string(),
+    };
+    let key = api_key(&server.id);
+    Ok(Conn { settings, server, base, key })
 }
 
 #[derive(serde::Serialize)]
@@ -69,8 +94,8 @@ struct KeyStatus {
 }
 
 #[tauri::command]
-fn api_key_status() -> KeyStatus {
-    let in_keyring = keyring_entry()
+fn api_key_status(server: String) -> KeyStatus {
+    let in_keyring = keyring_entry(&server)
         .and_then(|e| e.get_password().map_err(|e| e.to_string()))
         .map(|k| !k.is_empty())
         .unwrap_or(false);
@@ -84,19 +109,19 @@ fn api_key_status() -> KeyStatus {
 }
 
 #[tauri::command]
-fn set_api_key(key: String) -> CmdResult<()> {
+fn set_api_key(server: String, key: String) -> CmdResult<()> {
     let key = key.trim();
     if key.is_empty() {
         return Err("Clé vide".into());
     }
-    keyring_entry()?
+    keyring_entry(&server)?
         .set_password(key)
         .map_err(|e| format!("Impossible d'écrire dans le trousseau du système : {e}"))
 }
 
 #[tauri::command]
-fn delete_api_key() -> CmdResult<()> {
-    match keyring_entry()?.delete_credential() {
+fn delete_api_key(server: String) -> CmdResult<()> {
+    match keyring_entry(&server)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -108,8 +133,21 @@ fn get_settings(app: AppHandle) -> CmdResult<Settings> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> {
-    ollama::validate_base_url(settings.base_url.trim())?;
+async fn save_settings(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, mut settings: Settings) -> CmdResult<()> {
+    // La date de dernière sauvegarde appartient au backend : l'interface peut en avoir une copie périmée.
+    if let Ok(disk) = storage::load_settings(&app) {
+        settings.last_backup = disk.last_backup;
+    }
+    if settings.servers.is_empty() {
+        return Err("Au moins un serveur Ollama est nécessaire".into());
+    }
+    for v in &settings.servers {
+        if v.ssh_host.is_none() {
+            ollama::validate_base_url(v.url.trim()).map_err(|e| format!("Serveur « {} » : {e}", v.name))?;
+        }
+    }
+    // Les tunnels des serveurs inactifs sont fermés ; celui du serveur actif est rouvert au besoin.
+    tunnels.close_except(Some(&settings.active().id)).await;
     if !settings.transcription_url.trim().is_empty() {
         ollama::validate_base_url(settings.transcription_url.trim())?;
     }
@@ -165,7 +203,13 @@ fn vault_import_key(app: AppHandle, key: String) -> CmdResult<()> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OllamaStatus {
+    /// Identifiant et nom du serveur actif.
+    id: String,
+    name: String,
+    /// Adresse affichée (celle du serveur, pas le port local d'un tunnel).
     url: String,
+    /// Nom du serveur SSH quand la connexion passe par un tunnel.
+    tunnel: Option<String>,
     version: Option<String>,
     error: Option<String>,
     /// HTTP en clair hors de cette machine : la clé API éventuelle transite sans chiffrement.
@@ -173,59 +217,87 @@ struct OllamaStatus {
 }
 
 #[tauri::command]
-async fn server_status(app: AppHandle) -> CmdResult<OllamaStatus> {
-    let (s, key) = server(&app)?;
-    let insecure = s.base_url.trim().starts_with("http://") && !ollama::is_loopback(&s.base_url);
-    let (version, error) = match ollama::version(&s.base_url, &key).await {
-        Ok(v) => (Some(v), None),
+async fn server_status(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<OllamaStatus> {
+    let settings = storage::load_settings(&app)?;
+    let server = settings.active();
+    let tunnel = server.ssh_host.as_deref().map(|id| find_host(&app, id).map(|h| h.label).unwrap_or_else(|_| "serveur SSH supprimé".into()));
+    let url = match &tunnel {
+        Some(label) => format!("{label} · tunnel SSH vers le port {}", server.remote_port.unwrap_or(11434)),
+        None => server.url.trim().to_string(),
+    };
+    let insecure = tunnel.is_none() && url.starts_with("http://") && !ollama::is_loopback(&url);
+    let (version, error) = match conn(&app, &tunnels).await {
+        Ok(c) => match ollama::version(&c.base, &c.key).await {
+            Ok(v) => (Some(v), None),
+            // Derrière un tunnel, l'adresse locale n'aide pas : on nomme le serveur.
+            Err(e) if tunnel.is_some() => (None, Some(format!("Tunnel SSH ouvert, mais Ollama ne répond pas sur le port {} du serveur ({e})", c.server.remote_port.unwrap_or(11434)))),
+            Err(e) => (None, Some(e)),
+        },
         Err(e) => (None, Some(e)),
     };
-    Ok(OllamaStatus { url: s.base_url, version, error, insecure })
+    Ok(OllamaStatus { id: server.id, name: server.name, url, tunnel, version, error, insecure })
 }
 
 #[tauri::command]
-async fn list_models(app: AppHandle) -> CmdResult<Vec<ModelInfo>> {
-    let (s, key) = server(&app)?;
-    ollama::list_models(&s.base_url, &key).await
+async fn list_models(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<Vec<ModelInfo>> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::list_models(&c.base, &c.key).await
 }
 
 #[tauri::command]
-async fn running_models(app: AppHandle) -> CmdResult<Vec<RunningModel>> {
-    let (s, key) = server(&app)?;
-    ollama::running_models(&s.base_url, &key).await
+async fn running_models(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<Vec<RunningModel>> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::running_models(&c.base, &c.key).await
 }
 
 /// Télécharge un modèle ; renvoie false si l'utilisateur a annulé.
 #[tauri::command]
-async fn pull_model(app: AppHandle, streams: State<'_, Streams>, request_id: String, model: String, on_progress: Channel<PullProgress>) -> CmdResult<bool> {
+async fn pull_model(
+    app: AppHandle,
+    streams: State<'_, Streams>,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
+    request_id: String,
+    model: String,
+    on_progress: Channel<PullProgress>,
+) -> CmdResult<bool> {
     let model = model.trim().to_string();
     if model.is_empty() || model.chars().any(|c| c.is_whitespace()) {
         return Err("Nom de modèle invalide (ex. qwen3:8b)".into());
     }
-    let (s, key) = server(&app)?;
+    let c = conn(&app, &tunnels).await?;
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let res = ollama::pull_model(&s.base_url, &key, &model, &on_progress, cancel).await;
+    let res = ollama::pull_model(&c.base, &c.key, &model, &on_progress, cancel).await;
     streams.0.lock().unwrap().remove(&request_id);
     res
 }
 
 #[tauri::command]
-async fn delete_model(app: AppHandle, model: String) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::delete_model(&s.base_url, &key, &model).await
+async fn delete_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::delete_model(&c.base, &c.key, &model).await
 }
 
 #[tauri::command]
-async fn unload_model(app: AppHandle, model: String) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::unload_model(&s.base_url, &key, &model).await
+async fn unload_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::unload_model(&c.base, &c.key, &model).await
 }
 
 #[tauri::command]
-async fn preload_model(app: AppHandle, model: String, num_ctx: Option<u32>) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::preload_model(&s.base_url, &key, &model, &s.keep_alive, num_ctx).await
+async fn preload_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String, num_ctx: Option<u32>) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::preload_model(&c.base, &c.key, &model, &c.settings.keep_alive, num_ctx).await
+}
+
+#[tauri::command]
+fn list_assistants(app: AppHandle) -> Vec<serde_json::Value> {
+    storage::load_assistants(&app)
+}
+
+#[tauri::command]
+fn save_assistants(app: AppHandle, assistants: Vec<serde_json::Value>) -> CmdResult<()> {
+    storage::save_assistants(&app, &assistants)
 }
 
 #[tauri::command]
@@ -269,14 +341,15 @@ fn data_dir(app: AppHandle) -> CmdResult<String> {
 async fn chat_stream(
     app: AppHandle,
     streams: State<'_, Streams>,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
     request_id: String,
     request: ChatRequest,
     on_event: Channel<StreamEvent>,
 ) -> CmdResult<()> {
-    let (settings, key) = server(&app)?;
+    let c = conn(&app, &tunnels).await?;
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let result = ollama::chat_stream(&settings.base_url, &key, &settings.keep_alive, request, &on_event, cancel).await;
+    let result = ollama::chat_stream(&c.base, &c.key, &c.settings.keep_alive, request, &on_event, cancel).await;
     streams.0.lock().unwrap().remove(&request_id);
     result
 }
@@ -307,34 +380,60 @@ fn tool_outside(app: AppHandle, ctx: ToolContext, name: String, arguments: Strin
     tools::outside(&ctx, &storage::load_workspaces(&app), &storage::load_ssh_hosts(&app), &name, &arguments)
 }
 
+/// Appel d'outil à exécuter.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallReq {
+    name: String,
+    arguments: String,
+    /// Mot de passe sudo saisi pour cette commande (jamais enregistré).
+    sudo_password: Option<String>,
+}
+
 #[tauri::command]
 async fn run_tool(
     app: AppHandle,
     streams: State<'_, Streams>,
-    mcp: State<'_, Arc<McpManager>>,
     request_id: String,
     ctx: ToolContext,
-    name: String,
-    arguments: String,
+    call: ToolCallReq,
+    on_output: Channel<String>,
 ) -> CmdResult<ToolOutput> {
+    let mcp = app.state::<Arc<McpManager>>();
+    let tunnels = app.state::<Arc<tunnel::Tunnels>>();
+    let ToolCallReq { name, arguments, sudo_password } = call;
     let settings = storage::load_settings(&app)?;
     let approved = storage::load_workspaces(&app);
     let hosts = storage::load_ssh_hosts(&app);
     let project = ctx.project.as_deref().and_then(|id| storage::load_project(&app, id).ok());
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project };
+    let live: workspace::Live = Arc::new(move |text| {
+        let _ = on_output.send(text);
+    });
+    let sudo = sudo_password.filter(|p| !p.is_empty() && !p.contains(['\n', '\r']));
+    let embed = match (&ctx.project, name.as_str()) {
+        (Some(id), "search_project_files") => embed_for(&app, &tunnels, id).await,
+        _ => None,
+    };
+    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project, live: Some(live), sudo, embed };
     let out = if name == "run_command" {
         // La commande gère elle-même l'annulation (arrêt du groupe de processus).
         tools::run(&ctx, env, &name, &arguments).await
     } else {
         tokio::select! {
             o = tools::run(&ctx, env, &name, &arguments) => o,
-            _ = cancel.notified() => ToolOutput { content: "Annulé par l'utilisateur".into(), is_error: true, diff: None },
+            _ = cancel.notified() => ToolOutput { content: "Annulé par l'utilisateur".into(), is_error: true, ..Default::default() },
         }
     };
     streams.0.lock().unwrap().remove(&request_id);
     Ok(out)
+}
+
+/// Annule une modification de fichier faite par l'agent (contenu précédent, ou suppression d'un fichier créé).
+#[tauri::command]
+async fn restore_file(app: AppHandle, ctx: ToolContext, path: String, before: Option<String>) -> CmdResult<()> {
+    tools::restore(&ctx, &storage::load_workspaces(&app), &storage::load_ssh_hosts(&app), &path, before.as_deref()).await
 }
 
 // ------------------------------------------------------------------ dossiers de projet
@@ -389,12 +488,57 @@ fn save_project(app: AppHandle, project: storage::Project) -> CmdResult<()> {
     storage::save_project(&app, &project)
 }
 
+/// Serveur d'embedding et fichier d'index d'un projet, si la recherche sémantique est configurée.
+async fn embed_for(app: &AppHandle, tunnels: &tunnel::Tunnels, project_id: &str) -> Option<(embed::EmbedConn, std::path::PathBuf)> {
+    let settings = storage::load_settings(app).ok()?;
+    let model = settings.embedding_model.trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
+    let c = conn(app, tunnels).await.ok()?;
+    Some((embed::EmbedConn { base: c.base, key: c.key, model }, storage::project_index_path(app, project_id).ok()?))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectContextOut {
+    #[serde(flatten)]
+    context: knowledge::ProjectContext,
+    /// « semantic » (mots-clés + sens), « keywords », ou la raison pour laquelle le sens n'a pas servi.
+    search: String,
+}
+
 /// Fichiers de référence à joindre pour une question : en entier, ou extraits pertinents (gros projets).
+/// `on_progress` : avancement de l'indexation sémantique (extraits faits, total).
 #[tauri::command]
-async fn project_context(app: AppHandle, id: String, query: String) -> CmdResult<knowledge::ProjectContext> {
-    tauri::async_runtime::spawn_blocking(move || storage::load_project(&app, &id).map(|p| knowledge::context(&p, &query)))
+async fn project_context(
+    app: AppHandle,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
+    id: String,
+    query: String,
+    on_progress: Channel<[usize; 2]>,
+) -> CmdResult<ProjectContextOut> {
+    let project = storage::load_project(&app, &id)?;
+    let mut search = "keywords".to_string();
+    let mut semantic = None;
+    if knowledge::total_chars(&project) > knowledge::FULL_CONTEXT_CHARS {
+        if let Some((conn, index)) = embed_for(&app, &tunnels, &id).await {
+            let progress = move |done: usize, total: usize| {
+                let _ = on_progress.send([done, total]);
+            };
+            match embed::rank(&index, &conn, &knowledge::chunks(&project), &query, &progress).await {
+                Ok(order) => {
+                    semantic = Some(order);
+                    search = "semantic".into();
+                }
+                // Modèle absent, serveur occupé… : la recherche par mots-clés prend le relais.
+                Err(e) => search = e,
+            }
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || ProjectContextOut { context: knowledge::context(&project, &query, semantic.as_deref()), search })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -503,6 +647,22 @@ async fn ssh_trust(host: ssh::SshHost) -> CmdResult<()> {
     ssh::trust(&host).await
 }
 
+/// Installe la clé de l'application sur le serveur ; le mot de passe ne sert qu'à cet appel.
+#[tauri::command]
+async fn ssh_install_key(host: ssh::SshHost, password: String) -> CmdResult<ssh::KeySetup> {
+    ssh::install_key(&host, &password).await
+}
+
+#[tauri::command]
+async fn ssh_public_key() -> CmdResult<String> {
+    ssh::public_key().await
+}
+
+#[tauri::command]
+fn ssh_config_hosts() -> Vec<ssh::ConfigHost> {
+    ssh::config_hosts()
+}
+
 fn find_host(app: &AppHandle, id: &str) -> CmdResult<ssh::SshHost> {
     storage::load_ssh_hosts(app).into_iter().find(|h| h.id == id).ok_or_else(|| "Serveur SSH inconnu".to_string())
 }
@@ -596,6 +756,8 @@ async fn git_init(app: AppHandle, workspace: String) -> CmdResult<()> {
 struct DocumentText {
     text: String,
     method: &'static str,
+    /// PDF sans texte extractible : à faire lire par un modèle vision (`pdf_page_images`).
+    scanned: bool,
 }
 
 fn extract_pdf_local(bytes: Vec<u8>) -> CmdResult<(String, usize)> {
@@ -618,10 +780,160 @@ async fn process_document(data_base64: String) -> CmdResult<DocumentText> {
         .map_err(|_| "L'extraction a échoué sur ce PDF".to_string())?
         .map_err(|e| format!("Extraction impossible : {e}"))?;
     // Presque pas de texte : PDF scanné (images de pages).
-    if text.trim().chars().count() < 20 * pages {
-        return Err("Ce PDF semble scanné (pas de texte extractible). Joignez plutôt des captures des pages à un modèle vision (gemma3, qwen2.5vl, mistral-small3.2…).".into());
+    let scanned = text.trim().chars().count() < 20 * pages;
+    Ok(DocumentText { text: if scanned { String::new() } else { text }, method: "local", scanned })
+}
+
+/// Pages lues au plus dans un PDF scanné (une requête au modèle vision par page).
+const MAX_SCANNED_PAGES: usize = 40;
+
+/// Images des pages d'un PDF scanné, pour les faire transcrire par un modèle vision.
+#[tauri::command]
+async fn pdf_page_images(data_base64: String) -> CmdResult<pdfscan::PageImages> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| format!("Fichier illisible : {e}"))?;
+    tokio::task::spawn_blocking(move || pdfscan::page_images(&bytes, MAX_SCANNED_PAGES))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ------------------------------------------------------------------ sauvegarde chiffrée
+
+const BACKUP_KEYRING_USER: &str = "backup-passphrase";
+
+fn backup_entry() -> CmdResult<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, BACKUP_KEYRING_USER).map_err(|e| e.to_string())
+}
+
+/// Phrase secrète des sauvegardes, gardée dans le trousseau du système.
+fn backup_passphrase() -> Option<String> {
+    backup_entry().ok()?.get_password().ok().filter(|p| !p.is_empty())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupStatus {
+    has_passphrase: bool,
+    /// Date de la dernière sauvegarde (ms), 0 si aucune.
+    last: u64,
+}
+
+#[tauri::command]
+fn backup_status(app: AppHandle) -> BackupStatus {
+    BackupStatus { has_passphrase: backup_passphrase().is_some(), last: storage::load_settings(&app).map(|s| s.last_backup).unwrap_or(0) }
+}
+
+#[tauri::command]
+fn backup_set_passphrase(passphrase: String) -> CmdResult<()> {
+    if passphrase.chars().count() < 8 {
+        return Err("La phrase secrète doit compter au moins 8 caractères".into());
     }
-    Ok(DocumentText { text, method: "local" })
+    backup_entry()?
+        .set_password(&passphrase)
+        .map_err(|e| format!("Impossible d'écrire dans le trousseau du système : {e}"))
+}
+
+#[tauri::command]
+async fn backup_pick_dir(app: AppHandle) -> CmdResult<Option<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_title("Dossier des sauvegardes").pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let Some(path) = rx.await.map_err(|e| e.to_string())? else { return Ok(None) };
+    Ok(Some(path.into_path().map_err(|e| e.to_string())?.display().to_string()))
+}
+
+/// Écrit une sauvegarde chiffrée dans le dossier configuré et renvoie son chemin.
+fn run_backup(app: &AppHandle) -> CmdResult<String> {
+    let mut settings = storage::load_settings(app)?;
+    let dir = settings.backup_dir.trim().to_string();
+    if dir.is_empty() {
+        return Err("Choisissez d'abord le dossier des sauvegardes".into());
+    }
+    let passphrase = backup_passphrase().ok_or("Définissez d'abord la phrase secrète des sauvegardes")?;
+    let now = now_ms();
+    let sealed = backup::seal(storage::backup_entries(app)?, &passphrase, now)?;
+    let path = backup::write(std::path::Path::new(&dir), &sealed, now / 1000, settings.backup_keep as usize)?;
+    settings.last_backup = now;
+    storage::save_settings(app, &settings)?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+async fn backup_now(app: AppHandle) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || run_backup(&app)).await.map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreSummary {
+    conversations: usize,
+    projects: usize,
+    /// Autres fichiers restaurés (réglages, assistants, serveurs SSH…).
+    others: usize,
+}
+
+/// Restaure une sauvegarde choisie par l'utilisateur. Les éléments de même identifiant sont
+/// remplacés, les autres conservés. `None` si la boîte de dialogue a été annulée.
+#[tauri::command]
+async fn backup_restore(app: AppHandle, passphrase: String) -> CmdResult<Option<RestoreSummary>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Restaurer une sauvegarde")
+        .add_filter("Sauvegarde Ollama Desktop", &[backup::EXTENSION])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx.await.map_err(|e| e.to_string())? else { return Ok(None) };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let passphrase = if passphrase.is_empty() { backup_passphrase().ok_or("Saisissez la phrase secrète de cette sauvegarde")? } else { passphrase };
+        let files = backup::open(&data, &passphrase)?;
+        let mut sum = RestoreSummary { conversations: 0, projects: 0, others: 0 };
+        for (name, bytes) in files {
+            if storage::restore_entry(&app, &name, &bytes)? {
+                match name.split_once('/') {
+                    Some(("conversations", _)) => sum.conversations += 1,
+                    Some(("projects", _)) => sum.projects += 1,
+                    _ => sum.others += 1,
+                }
+            }
+        }
+        storage::drop_index(&app)?;
+        Ok(Some(sum))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ------------------------------------------------------------------ saisie rapide
+
+/// Applique le raccourci global des réglages ; l'erreur éventuelle est à afficher.
+#[tauri::command]
+fn quick_apply_shortcut(app: AppHandle) -> CmdResult<()> {
+    quick::apply_shortcut(&app, &storage::load_settings(&app)?.quick_shortcut)
+}
+
+#[tauri::command]
+fn quick_submit(app: AppHandle, text: String) -> CmdResult<()> {
+    quick::submit(&app, &text)
+}
+
+/// `blurred` : la mini-fenêtre a perdu le focus (ignoré juste après son affichage).
+#[tauri::command]
+fn quick_hide(app: AppHandle, blurred: bool) {
+    if blurred {
+        quick::blurred(&app);
+    } else {
+        quick::hide(&app);
+    }
 }
 
 // ------------------------------------------------------------------ MCP
@@ -719,6 +1031,12 @@ async fn install_update(app: AppHandle, on_progress: Channel<serde_json::Value>)
     app.restart()
 }
 
+/// Modes sans interface : « askpass » (voir `ssh::askpass_main`) et `--quick` adressé à une
+/// instance déjà lancée. Renvoie le code de sortie, ou None lors d'un lancement normal.
+pub fn askpass() -> Option<i32> {
+    ssh::askpass_main().or_else(|| quick::signal_running_instance().then_some(0))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(unix)]
@@ -731,9 +1049,11 @@ pub fn run() {
     let app = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Streams::default())
         .manage(Dictation::default())
         .manage(Arc::new(McpManager::default()))
+        .manage(Arc::new(tunnel::Tunnels::default()))
         .setup(|app| {
             // Chiffrement des données locales : activé avant tout accès aux conversations,
             // puis conversion des fichiers existants (synchrone, pour éviter toute course).
@@ -744,6 +1064,23 @@ pub fn run() {
                     Err(e) => *vault::LAST_ERROR.lock().unwrap() = Some(e),
                 }
             }
+            // Saisie rapide : raccourci global (s'il est défini) et écoute de `--quick`.
+            if let Ok(s) = storage::load_settings(app.handle()) {
+                if let Err(e) = quick::apply_shortcut(app.handle(), &s.quick_shortcut) {
+                    eprintln!("{e}");
+                }
+            }
+            quick::listen(app.handle());
+            // Sauvegarde automatique : une fois par jour, au démarrage.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let Ok(s) = storage::load_settings(&handle) else { return };
+                if s.backup_auto && !s.backup_dir.trim().is_empty() && now_ms().saturating_sub(s.last_backup) > 20 * 3600 * 1000 {
+                    if let Err(e) = run_backup(&handle) {
+                        eprintln!("sauvegarde automatique impossible : {e}");
+                    }
+                }
+            });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mgr = handle.state::<Arc<McpManager>>().inner().clone();
@@ -757,6 +1094,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             api_key_status,
             server_status,
+            list_assistants,
+            save_assistants,
             running_models,
             pull_model,
             delete_model,
@@ -783,11 +1122,21 @@ pub fn run() {
             preview_tool,
             tool_outside,
             run_tool,
+            restore_file,
             pick_workspace,
             list_workspaces,
             forget_workspace,
             touch_workspace,
             process_document,
+            pdf_page_images,
+            quick_apply_shortcut,
+            quick_submit,
+            quick_hide,
+            backup_status,
+            backup_set_passphrase,
+            backup_pick_dir,
+            backup_now,
+            backup_restore,
             mcp_get_config,
             mcp_save_config,
             mcp_restart,
@@ -803,6 +1152,9 @@ pub fn run() {
             ssh_delete_host,
             ssh_test,
             ssh_trust,
+            ssh_install_key,
+            ssh_public_key,
+            ssh_config_hosts,
             ssh_list_dirs,
             ssh_open_workspace,
             git_status,
@@ -828,10 +1180,19 @@ pub fn run() {
         .expect("erreur au lancement de l'application");
 
     app.run(|handle, event| {
+        // Fermer la fenêtre principale quitte l'application, même si la mini-fenêtre existe encore.
+        if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+            if label == "main" {
+                handle.exit(0);
+            }
+        }
         if let tauri::RunEvent::Exit = event {
+            quick::cleanup();
             // Arrêt propre des serveurs MCP (processus enfants).
             let mgr = handle.state::<Arc<McpManager>>().inner().clone();
             tauri::async_runtime::block_on(mgr.shutdown());
+            let tunnels = handle.state::<Arc<tunnel::Tunnels>>().inner().clone();
+            tauri::async_runtime::block_on(tunnels.close_except(None));
         }
     });
 }

@@ -287,11 +287,77 @@ pub fn truncate_middle(s: &str, max: usize) -> String {
     format!("{head}\n\n[… {} caractères omis …]\n\n{tail}", n - max)
 }
 
+/// Reçoit la sortie d'une commande au fil de l'eau (affichage en direct).
+pub type Live = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Découpe un flux d'octets en chaînes UTF-8 valides : un caractère coupé entre deux
+/// lectures est reporté sur la suivante.
+pub struct LiveSink {
+    live: Option<Live>,
+    carry: Vec<u8>,
+}
+
+impl LiveSink {
+    pub fn new(live: Option<Live>) -> Self {
+        Self { live, carry: Vec::new() }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        let Some(live) = &self.live else { return };
+        self.carry.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.carry) {
+            Ok(_) => self.carry.len(),
+            // Fin incomplète (< 4 octets) : on attend la suite ; séquence invalide : conversion avec perte.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => self.carry.len(),
+        };
+        if valid > 0 {
+            let text = String::from_utf8_lossy(&self.carry[..valid]).into_owned();
+            self.carry.drain(..valid);
+            live(text);
+        }
+    }
+}
+
+/// Lit un flux jusqu'au bout en le relayant au fil de l'eau.
+pub async fn read_live<S: tokio::io::AsyncRead + Unpin>(mut stream: S, live: Option<Live>) -> Vec<u8> {
+    let mut sink = LiveSink::new(live);
+    let mut all = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while let Ok(n) = stream.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&chunk[..n]);
+        sink.push(&chunk[..n]);
+    }
+    all
+}
+
+/// Préambule d'une commande utilisant sudo : la première ligne de l'entrée standard (le mot
+/// de passe) valide sudo pour ce shell, puis l'entrée est fermée. Le mot de passe ne figure
+/// ni dans la commande, ni dans l'environnement, ni sur le disque, et la commande ne peut pas le lire.
+pub const SUDO_PREAMBLE: &str = "sudo -S -p '' -v 2>/dev/null || echo '[sudo : mot de passe refusé, ou sudo indisponible pour cet utilisateur]' >&2\nexec </dev/null\n";
+
+/// Options d'exécution d'une commande.
+#[derive(Default, Clone)]
+pub struct RunOpts {
+    /// Sortie relayée au fil de l'eau.
+    pub live: Option<Live>,
+    /// Mot de passe sudo saisi par l'utilisateur pour cette commande.
+    pub sudo: Option<String>,
+}
+
 /// Exécute une commande shell dans le dossier du projet, avec délai max et annulation.
-pub async fn run_command(root: &Path, shell: &Shell, command: &str, timeout_secs: u64, cancel: Arc<Notify>) -> R<String> {
+pub async fn run_command(root: &Path, shell: &Shell, command: &str, timeout_secs: u64, cancel: Arc<Notify>, opts: RunOpts) -> R<String> {
     let root = simplify_path(&root.canonicalize().map_err(|e| e.to_string())?);
     let mut cmd = tokio::process::Command::new(&shell.program);
-    cmd.args(crate::shell::args(shell, command));
+    // sudo : uniquement avec un shell POSIX natif (pas de sudo sous Windows).
+    let sudo = opts.sudo.as_deref().filter(|_| shell.kind == crate::shell::ShellKind::Posix);
+    match sudo {
+        Some(_) => cmd.args(crate::shell::args(shell, &format!("{SUDO_PREAMBLE}{command}"))),
+        None => cmd.args(crate::shell::args(shell, command)),
+    };
     #[cfg(windows)]
     {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -303,7 +369,7 @@ pub async fn run_command(root: &Path, shell: &Shell, command: &str, timeout_secs
     #[cfg(not(windows))]
     cmd.process_group(0); // pour tuer aussi les sous-processus
     cmd.current_dir(&root)
-        .stdin(Stdio::null())
+        .stdin(if sudo.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("CI", "1")
@@ -314,18 +380,16 @@ pub async fn run_command(root: &Path, shell: &Shell, command: &str, timeout_secs
 
     let mut child = cmd.spawn().map_err(|e| format!("Lancement impossible : {e}"))?;
     let pid = child.id();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let read_out = async move {
-        let mut b = Vec::new();
-        let _ = stdout.read_to_end(&mut b).await;
-        b
-    };
-    let read_err = async move {
-        let mut b = Vec::new();
-        let _ = stderr.read_to_end(&mut b).await;
-        b
-    };
+    if let (Some(password), Some(mut stdin)) = (sudo, child.stdin.take()) {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("{password}\n");
+        tokio::spawn(async move {
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+    let read_out = read_live(child.stdout.take().unwrap(), opts.live.clone());
+    let read_err = read_live(child.stderr.take().unwrap(), opts.live.clone());
     let run = async {
         let (o, e, status) = tokio::join!(read_out, read_err, child.wait());
         (o, e, status)
@@ -450,10 +514,10 @@ mod tests {
     async fn commands_run_in_root_and_time_out() {
         let d = tmp();
         let sh = crate::shell::detect("auto");
-        let out = run_command(&d, &sh, "pwd && echo err >&2", 10, Arc::new(Notify::new())).await.unwrap();
+        let out = run_command(&d, &sh, "pwd && echo err >&2", 10, Arc::new(Notify::new()), Default::default()).await.unwrap();
         assert!(out.contains("Code de sortie : 0"));
         assert!(out.contains("err"));
-        let err = run_command(&d, &sh, "sleep 5", 1, Arc::new(Notify::new())).await.unwrap_err();
+        let err = run_command(&d, &sh, "sleep 5", 1, Arc::new(Notify::new()), Default::default()).await.unwrap_err();
         assert!(err.contains("Délai"));
     }
 
@@ -466,17 +530,48 @@ mod tests {
         let d = tmp();
         for pref in ["auto", "pwsh", "powershell"] {
             let sh = detect(pref);
-            let ok = run_command(&d, &sh, "echo bonjour", 60, Arc::new(Notify::new())).await.unwrap();
+            let ok = run_command(&d, &sh, "echo bonjour", 60, Arc::new(Notify::new()), Default::default()).await.unwrap();
             assert!(ok.contains("Code de sortie : 0") && ok.contains("bonjour"), "{pref} ({:?}) : {ok}", sh.kind);
             let fail = if sh.kind == ShellKind::GitBash { "exit 3" } else { "cmd /c exit 3" };
-            let ko = run_command(&d, &sh, fail, 60, Arc::new(Notify::new())).await.unwrap();
+            let ko = run_command(&d, &sh, fail, 60, Arc::new(Notify::new()), Default::default()).await.unwrap();
             assert!(ko.contains("Code de sortie : 3"), "{pref} ({:?}) : {ko}", sh.kind);
         }
         // Accents et écriture dans le dossier du projet.
         let sh = detect("auto");
         let cmd = if sh.kind == ShellKind::GitBash { "echo 'é' > accent.txt && cat accent.txt" } else { "Set-Content accent.txt 'é'; Get-Content accent.txt" };
-        let out = run_command(&d, &sh, cmd, 60, Arc::new(Notify::new())).await.unwrap();
+        let out = run_command(&d, &sh, cmd, 60, Arc::new(Notify::new()), Default::default()).await.unwrap();
         assert!(out.contains('é'), "{:?} : {out}", sh.kind);
         assert!(d.join("accent.txt").is_file());
+    }
+
+    #[test]
+    fn live_sink_keeps_multibyte_characters_whole() {
+        let got = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_got = got.clone();
+        let mut sink = LiveSink::new(Some(Arc::new(move |t| sink_got.lock().unwrap().push(t))));
+        let bytes = "été ✓".as_bytes();
+        // Coupure au milieu du « é » puis du « ✓ ».
+        sink.push(&bytes[..1]);
+        sink.push(&bytes[1..7]);
+        sink.push(&bytes[7..]);
+        assert_eq!(got.lock().unwrap().concat(), "été ✓");
+        assert!(got.lock().unwrap().iter().all(|c| !c.contains('\u{fffd}')));
+    }
+
+    #[tokio::test]
+    async fn command_output_is_streamed() {
+        let d = tmp();
+        let sh = crate::shell::detect("auto");
+        if sh.kind != crate::shell::ShellKind::Posix {
+            return;
+        }
+        let got = Arc::new(std::sync::Mutex::new(String::new()));
+        let live_got = got.clone();
+        let opts = RunOpts { live: Some(Arc::new(move |t| live_got.lock().unwrap().push_str(&t))), sudo: None };
+        let out = run_command(&d, &sh, "echo un; echo deux >&2", 10, Arc::new(Notify::new()), opts).await.unwrap();
+        assert!(out.contains("un") && out.contains("deux"));
+        let live = got.lock().unwrap().clone();
+        assert!(live.contains("un") && live.contains("deux"), "{live:?}");
+        fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -12,11 +12,28 @@ use tauri_plugin_dialog::DialogExt;
 
 type R<T> = Result<T, String>;
 
+/// Un serveur Ollama : adresse directe, ou tunnel SSH vers un serveur enregistré.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Server {
+    pub id: String,
+    pub name: String,
+    /// Adresse directe (local, réseau privé, ou distant en HTTPS). Ignorée avec un tunnel SSH.
+    pub url: String,
+    /// Tunnel SSH : identifiant d'un serveur SSH enregistré.
+    pub ssh_host: Option<String>,
+    /// Port d'Ollama sur le serveur SSH (11434 par défaut).
+    pub remote_port: Option<u16>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Serveur Ollama (local, réseau privé, ou distant en HTTPS).
+    /// Ancien réglage (versions < 0.4) : repris comme premier serveur à la migration.
     pub base_url: String,
+    /// Serveurs Ollama et identifiant de celui utilisé.
+    pub servers: Vec<Server>,
+    pub active_server: String,
     /// Modèle par défaut (vide = premier modèle installé).
     pub default_model: String,
     pub system_prompt: String,
@@ -59,6 +76,22 @@ pub struct Settings {
     pub transcription_vocabulary: String,
     /// Chiffrement des conversations, projets et mcp.json (clé dans le trousseau du système).
     pub encrypt_data: bool,
+    /// Modèle d'embedding Ollama pour la recherche sémantique dans les projets (vide = mots-clés seuls).
+    pub embedding_model: String,
+    /// Modèle vision utilisé pour lire les PDF scannés (vide = désactivé).
+    pub ocr_model: String,
+    /// Sauvegarde chiffrée : dossier de destination (synchronisé par Nextcloud, Syncthing…),
+    /// sauvegarde quotidienne automatique, nombre de fichiers conservés, date de la dernière (ms).
+    pub backup_dir: String,
+    pub backup_auto: bool,
+    pub backup_keep: u32,
+    pub last_backup: u64,
+    /// Couleur d'accent de l'interface.
+    pub accent: String,
+    /// Raccourci global de la saisie rapide (« CmdOrCtrl+Shift+Space »…) ; vide = aucun.
+    pub quick_shortcut: String,
+    /// L'accueil guidé (serveur, premier modèle, prise en main) a été terminé.
+    pub onboarded: bool,
     /// Version du format des réglages, pour les migrations (absent = 0).
     #[serde(default)]
     pub settings_version: u32,
@@ -69,10 +102,28 @@ const SETTINGS_VERSION: u32 = 1;
 
 /// Mises à niveau des réglages d'anciennes versions.
 fn migrate_settings(s: &mut Settings) {
+    if s.servers.is_empty() {
+        // < 0.4 : une seule adresse de serveur.
+        let url = if s.base_url.trim().is_empty() { crate::ollama::DEFAULT_BASE_URL.to_string() } else { s.base_url.trim().to_string() };
+        s.servers = vec![Server { id: "default".into(), name: "Ollama".into(), url, ..Default::default() }];
+    }
+    if !s.servers.iter().any(|v| v.id == s.active_server) {
+        s.active_server = s.servers[0].id.clone();
+    }
     s.settings_version = SETTINGS_VERSION;
 }
 
 impl Settings {
+    /// Serveur Ollama utilisé.
+    pub fn active(&self) -> Server {
+        self.servers
+            .iter()
+            .find(|v| v.id == self.active_server)
+            .or_else(|| self.servers.first())
+            .cloned()
+            .unwrap_or_else(|| Server { id: "default".into(), name: "Ollama".into(), url: crate::ollama::DEFAULT_BASE_URL.into(), ..Default::default() })
+    }
+
     pub fn vocabulary(&self) -> Vec<String> {
         self.transcription_vocabulary
             .split([',', '\n', ';'])
@@ -87,6 +138,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             base_url: crate::ollama::DEFAULT_BASE_URL.into(),
+            servers: vec![Server { id: "default".into(), name: "Ollama".into(), url: crate::ollama::DEFAULT_BASE_URL.into(), ..Default::default() }],
+            active_server: "default".into(),
             default_model: String::new(),
             system_prompt: String::new(),
             temperature: None,
@@ -112,6 +165,15 @@ impl Default for Settings {
             transcription_language: "fr".into(),
             transcription_vocabulary: String::new(),
             encrypt_data: true,
+            embedding_model: String::new(),
+            ocr_model: String::new(),
+            backup_dir: String::new(),
+            backup_auto: false,
+            backup_keep: 7,
+            last_backup: 0,
+            accent: "teal".into(),
+            quick_shortcut: String::new(),
+            onboarded: false,
             settings_version: SETTINGS_VERSION,
         }
     }
@@ -226,16 +288,112 @@ fn secret_files(app: &AppHandle) -> R<Vec<PathBuf>> {
     let mut out = Vec::new();
     for dir in [conv_dir(app)?, projects_dir(app)?] {
         for e in fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
+            // `.emb` : index sémantique d'un projet.
+            if matches!(e.path().extension().and_then(|x| x.to_str()), Some("json" | "emb")) {
                 out.push(e.path());
             }
         }
     }
-    let mcp = mcp_path(app)?;
-    if mcp.exists() {
-        out.push(mcp);
+    for p in [mcp_path(app)?, assistants_path(app)?] {
+        if p.exists() {
+            out.push(p);
+        }
     }
     Ok(out)
+}
+
+/// Toutes les données à sauvegarder, en clair : `(nom dans la sauvegarde, contenu)`.
+/// Les clés API et la clé de chiffrement restent dans le trousseau ; les index
+/// (conversations, embeddings) sont reconstruits à la restauration.
+pub fn backup_entries(app: &AppHandle) -> R<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for (dir, prefix) in [(conv_dir(app)?, "conversations"), (projects_dir(app)?, "projects")] {
+        for e in fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            if p.extension().and_then(|x| x.to_str()) == Some("json") && name != "index.json" {
+                out.push((format!("{prefix}/{name}"), read_secret(&p)?));
+            }
+        }
+    }
+    for (path, name) in [(assistants_path(app)?, "assistants.json"), (mcp_path(app)?, "mcp.json")] {
+        if path.exists() {
+            out.push((name.to_string(), read_secret(&path)?));
+        }
+    }
+    for (path, name) in [
+        (settings_path(app)?, "settings.json"),
+        (ssh_hosts_path(app)?, "ssh_hosts.json"),
+        (data_dir(app)?.join("workspaces.json"), "workspaces.json"),
+        (usage_path(app)?, "usage.json"),
+    ] {
+        if let Ok(bytes) = fs::read(&path) {
+            out.push((name.to_string(), bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Remet en place un fichier d'une sauvegarde. Renvoie false pour un nom inconnu (ignoré).
+pub fn restore_entry(app: &AppHandle, name: &str, bytes: &[u8]) -> R<bool> {
+    let id_of = |file: &str| file.strip_suffix(".json").map(str::to_owned).ok_or_else(|| "nom de fichier invalide".to_string());
+    match name.split_once('/') {
+        Some(("conversations", file)) => {
+            let id = id_of(file)?;
+            check_id(&id)?;
+            write_secret(&conv_dir(app)?.join(format!("{id}.json")), bytes)?;
+        }
+        Some(("projects", file)) => {
+            let id = id_of(file)?;
+            check_id(&id)?;
+            write_secret(&projects_dir(app)?.join(format!("{id}.json")), bytes)?;
+        }
+        Some(_) => return Ok(false),
+        None => match name {
+            "assistants.json" => write_secret(&assistants_path(app)?, bytes)?,
+            "mcp.json" => write_secret(&mcp_path(app)?, bytes)?,
+            "settings.json" => {
+                // Les réglages propres à cette machine sont conservés.
+                let local = load_settings(app)?;
+                let mut s: Settings = serde_json::from_slice(bytes).map_err(|e| format!("réglages illisibles : {e}"))?;
+                migrate_settings(&mut s);
+                s.encrypt_data = local.encrypt_data;
+                s.backup_dir = local.backup_dir;
+                s.backup_auto = local.backup_auto;
+                s.last_backup = local.last_backup;
+                s.quick_shortcut = local.quick_shortcut;
+                save_settings(app, &s)?;
+            }
+            "ssh_hosts.json" => write_atomic(&ssh_hosts_path(app)?, bytes)?,
+            "workspaces.json" => write_atomic(&data_dir(app)?.join("workspaces.json"), bytes)?,
+            "usage.json" => write_atomic(&usage_path(app)?, bytes)?,
+            _ => return Ok(false),
+        },
+    }
+    Ok(true)
+}
+
+/// Force la reconstruction de la liste des conversations (après une restauration).
+pub fn drop_index(app: &AppHandle) -> R<()> {
+    let _ = fs::remove_file(index_path(app)?);
+    Ok(())
+}
+
+fn assistants_path(app: &AppHandle) -> R<PathBuf> {
+    Ok(data_dir(app)?.join("assistants.json"))
+}
+
+/// Assistants personnalisés (modèle, consignes, réglages) : tableau JSON géré par l'interface.
+pub fn load_assistants(app: &AppHandle) -> Vec<Value> {
+    assistants_path(app)
+        .ok()
+        .and_then(|p| read_secret(&p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_assistants(app: &AppHandle, list: &[Value]) -> R<()> {
+    write_secret_json(&assistants_path(app)?, &list)
 }
 
 /// Existe-t-il des fichiers déjà chiffrés ?
@@ -522,7 +680,14 @@ pub fn delete_project(app: &AppHandle, id: &str) -> R<()> {
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+    let _ = fs::remove_file(project_index_path(app, id)?);
     Ok(())
+}
+
+/// Index sémantique (embeddings) des fichiers de référence d'un projet.
+pub fn project_index_path(app: &AppHandle, id: &str) -> R<PathBuf> {
+    check_id(id)?;
+    Ok(projects_dir(app)?.join(format!("{id}.emb")))
 }
 
 fn ssh_hosts_path(app: &AppHandle) -> R<PathBuf> {
@@ -633,6 +798,13 @@ mod tests {
         assert_eq!(s.settings_version, SETTINGS_VERSION);
         assert_eq!(s.vocabulary(), ["Proxmox", "fail2ban", "ZFS"]);
         assert_eq!(s.base_url, "http://localhost:11434");
+        assert_eq!(s.active().url, "http://localhost:11434");
+
+        // Ancienne adresse unique reprise comme premier serveur.
+        let mut old: Settings = serde_json::from_str(r#"{"baseUrl":"http://192.168.1.20:11434","servers":[]}"#).unwrap();
+        migrate_settings(&mut old);
+        assert_eq!(old.servers.len(), 1);
+        assert_eq!(old.active(), Server { id: "default".into(), name: "Ollama".into(), url: "http://192.168.1.20:11434".into(), ..Default::default() });
         assert_eq!(s.num_ctx, 16384);
         assert!(Settings::default().encrypt_data);
     }

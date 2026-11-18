@@ -27,6 +27,7 @@ const SUGGESTIONS: { id: string; by: string; desc: string }[] = [
   { id: "qwen3-coder:30b", by: "Alibaba", desc: "30 B MoE, code · outils" },
   { id: "gpt-oss:20b", by: "OpenAI (open-weight)", desc: "20 B MoE · outils, raisonnement" },
   { id: "gemma3:12b", by: "Google", desc: "12 B · vision" },
+  { id: "bge-m3", by: "BAAI", desc: "embedding multilingue · recherche sémantique dans les projets" },
 ];
 
 let deps: Deps;
@@ -51,6 +52,7 @@ export function capsHtml(m: ModelInfo): string {
     m.vision ? '<span class="cap" title="Comprend les images">vision</span>' : "",
     m.thinking ? '<span class="cap" title="Raisonnement avant la réponse">raisonnement</span>' : "",
     m.remote ? '<span class="cap" title="Exécuté sur un serveur distant">cloud</span>' : "",
+    m.embedding ? '<span class="cap" title="Modèle d\'embedding : recherche sémantique dans les projets (Réglages → Outils)">embedding</span>' : "",
   ].join("");
 }
 
@@ -96,7 +98,7 @@ function renderInstalled() {
           return `<div class="md-row">
             <div class="md-main"><span><code>${id}</code>${capsHtml(m)}</span><small class="muted">${escapeHtml(meta)}</small></div>
             <span class="row">
-              <button type="button" class="btn-ghost sm" data-use="${id}" title="Utiliser pour la conversation en cours">Utiliser</button>
+              ${m.completion ? `<button type="button" class="btn-ghost sm" data-use="${id}" title="Utiliser pour la conversation en cours">Utiliser</button>` : ""}
               ${loaded.has(m.id) ? "" : `<button type="button" class="btn-ghost sm" data-load="${id}" title="Charger en mémoire maintenant">Charger</button>`}
               <button type="button" class="icon-btn sm" data-update="${id}" title="Mettre à jour (retélécharge les couches modifiées)">↻</button>
               <button type="button" class="icon-btn sm danger" data-delete="${id}" title="Supprimer du disque">×</button>
@@ -177,13 +179,15 @@ async function startPull(name: string) {
   }
 }
 
-export async function openModelsDialog() {
+/** `pullName` : lance aussitôt le téléchargement de ce modèle (accueil guidé). */
+export async function openModelsDialog(pullName?: string) {
   const dlg = $<HTMLDialogElement>("#models-dialog");
   const st = await api.serverStatus().catch(() => null);
   $("#md-server").textContent = st?.version ? `Ollama ${st.version} · ${st.url}` : st?.error ?? "";
   await deps.reload();
   await refresh();
   if (!dlg.open) dlg.showModal();
+  if (pullName) startPull(pullName);
   clearInterval(poll);
   poll = window.setInterval(() => {
     if (!dlg.open) return clearInterval(poll);
