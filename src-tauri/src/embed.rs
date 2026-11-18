@@ -82,7 +82,7 @@ impl Index {
         for _ in 0..count {
             let hash = u64::from_le_bytes(take(8)?.try_into().ok()?);
             let raw = take(dims * 4)?;
-            vectors.insert(hash, raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+            vectors.insert(hash, raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect());
         }
         Some(Index { model, vectors })
     }
