@@ -80,6 +80,16 @@ pub struct Settings {
     pub embedding_model: String,
     /// Modèle vision utilisé pour lire les PDF scannés (vide = désactivé).
     pub ocr_model: String,
+    /// Sauvegarde chiffrée : dossier de destination (synchronisé par Nextcloud, Syncthing…),
+    /// sauvegarde quotidienne automatique, nombre de fichiers conservés, date de la dernière (ms).
+    pub backup_dir: String,
+    pub backup_auto: bool,
+    pub backup_keep: u32,
+    pub last_backup: u64,
+    /// Couleur d'accent de l'interface.
+    pub accent: String,
+    /// Raccourci global de la saisie rapide (« CmdOrCtrl+Shift+Space »…) ; vide = aucun.
+    pub quick_shortcut: String,
     /// L'accueil guidé (serveur, premier modèle, prise en main) a été terminé.
     pub onboarded: bool,
     /// Version du format des réglages, pour les migrations (absent = 0).
@@ -157,6 +167,12 @@ impl Default for Settings {
             encrypt_data: true,
             embedding_model: String::new(),
             ocr_model: String::new(),
+            backup_dir: String::new(),
+            backup_auto: false,
+            backup_keep: 7,
+            last_backup: 0,
+            accent: "teal".into(),
+            quick_shortcut: String::new(),
             onboarded: false,
             settings_version: SETTINGS_VERSION,
         }
@@ -284,6 +300,83 @@ fn secret_files(app: &AppHandle) -> R<Vec<PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// Toutes les données à sauvegarder, en clair : `(nom dans la sauvegarde, contenu)`.
+/// Les clés API et la clé de chiffrement restent dans le trousseau ; les index
+/// (conversations, embeddings) sont reconstruits à la restauration.
+pub fn backup_entries(app: &AppHandle) -> R<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for (dir, prefix) in [(conv_dir(app)?, "conversations"), (projects_dir(app)?, "projects")] {
+        for e in fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            if p.extension().and_then(|x| x.to_str()) == Some("json") && name != "index.json" {
+                out.push((format!("{prefix}/{name}"), read_secret(&p)?));
+            }
+        }
+    }
+    for (path, name) in [(assistants_path(app)?, "assistants.json"), (mcp_path(app)?, "mcp.json")] {
+        if path.exists() {
+            out.push((name.to_string(), read_secret(&path)?));
+        }
+    }
+    for (path, name) in [
+        (settings_path(app)?, "settings.json"),
+        (ssh_hosts_path(app)?, "ssh_hosts.json"),
+        (data_dir(app)?.join("workspaces.json"), "workspaces.json"),
+        (usage_path(app)?, "usage.json"),
+    ] {
+        if let Ok(bytes) = fs::read(&path) {
+            out.push((name.to_string(), bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Remet en place un fichier d'une sauvegarde. Renvoie false pour un nom inconnu (ignoré).
+pub fn restore_entry(app: &AppHandle, name: &str, bytes: &[u8]) -> R<bool> {
+    let id_of = |file: &str| file.strip_suffix(".json").map(str::to_owned).ok_or_else(|| "nom de fichier invalide".to_string());
+    match name.split_once('/') {
+        Some(("conversations", file)) => {
+            let id = id_of(file)?;
+            check_id(&id)?;
+            write_secret(&conv_dir(app)?.join(format!("{id}.json")), bytes)?;
+        }
+        Some(("projects", file)) => {
+            let id = id_of(file)?;
+            check_id(&id)?;
+            write_secret(&projects_dir(app)?.join(format!("{id}.json")), bytes)?;
+        }
+        Some(_) => return Ok(false),
+        None => match name {
+            "assistants.json" => write_secret(&assistants_path(app)?, bytes)?,
+            "mcp.json" => write_secret(&mcp_path(app)?, bytes)?,
+            "settings.json" => {
+                // Les réglages propres à cette machine sont conservés.
+                let local = load_settings(app)?;
+                let mut s: Settings = serde_json::from_slice(bytes).map_err(|e| format!("réglages illisibles : {e}"))?;
+                migrate_settings(&mut s);
+                s.encrypt_data = local.encrypt_data;
+                s.backup_dir = local.backup_dir;
+                s.backup_auto = local.backup_auto;
+                s.last_backup = local.last_backup;
+                s.quick_shortcut = local.quick_shortcut;
+                save_settings(app, &s)?;
+            }
+            "ssh_hosts.json" => write_atomic(&ssh_hosts_path(app)?, bytes)?,
+            "workspaces.json" => write_atomic(&data_dir(app)?.join("workspaces.json"), bytes)?,
+            "usage.json" => write_atomic(&usage_path(app)?, bytes)?,
+            _ => return Ok(false),
+        },
+    }
+    Ok(true)
+}
+
+/// Force la reconstruction de la liste des conversations (après une restauration).
+pub fn drop_index(app: &AppHandle) -> R<()> {
+    let _ = fs::remove_file(index_path(app)?);
+    Ok(())
 }
 
 fn assistants_path(app: &AppHandle) -> R<PathBuf> {

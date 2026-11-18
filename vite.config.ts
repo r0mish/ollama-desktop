@@ -14,5 +14,7 @@ export default defineConfig({
   build: {
     target: ["es2021", "chrome105", "safari15"],
     chunkSizeWarningLimit: 1500,
+    // Deux pages : l'application et la mini-fenêtre de saisie rapide.
+    rollupOptions: { input: { main: "index.html", quick: "quick.html" } },
   },
 });

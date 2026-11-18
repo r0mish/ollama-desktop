@@ -1,6 +1,7 @@
 import "highlight.js/styles/github-dark.css";
 import "./styles.css";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
   type ApiMessage,
@@ -34,6 +35,7 @@ import { initGitUi, scheduleGitRefresh, toggleGitPanel } from "./git-ui";
 import { findProject, initProjectsUi, loadProjects, openProjectDialog, projectChars, projectList } from "./projects-ui";
 import { cancelDictation, initDictation, toggleDictation } from "./dictation";
 import { initModelsUi, openModelsDialog } from "./models-ui";
+import { initBackupUi, renderBackup } from "./backup-ui";
 import { initPopover } from "./popover";
 import { closePreview, initPreview, openPreview, type PreviewKind } from "./preview";
 import { commitServerForm, initServersUi, renderServerChip, renderServers, serversDraft } from "./servers-ui";
@@ -246,9 +248,11 @@ function toast(msg: string, isError = false) {
 
 const errMsg = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e));
 
-function applyTheme(theme: Settings["theme"]) {
+function applyTheme(theme: Settings["theme"], accent: Settings["accent"] = state.settings.accent) {
   if (theme === "system") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.dataset.theme = theme;
+  if (!accent || accent === "teal") document.documentElement.removeAttribute("data-accent");
+  else document.documentElement.dataset.accent = accent;
 }
 
 async function copy(text: string, btn?: HTMLElement) {
@@ -2694,6 +2698,13 @@ async function openSettings(tab = "general") {
   s.temp.value = st.temperature?.toString() ?? "";
   s.max.value = st.maxTokens?.toString() ?? "";
   s.theme.value = st.theme;
+  for (const r of accentRadios()) r.checked = r.value === (st.accent || "teal");
+  quickSelect.value = st.quickShortcut ?? "";
+  if (state.platform.os === "macos") for (const o of quickSelect.options) o.textContent = o.textContent!.replace("Ctrl", "Cmd").replace("Super", "Cmd").replace("Alt", "Option");
+  $("#s-quick-hint").textContent =
+    "Depuis n'importe quelle application, ouvre un champ de saisie : la question part dans une nouvelle conversation." +
+    (state.platform.os === "linux" ? " Sous Wayland, associez plutôt un raccourci du bureau à la commande « ollama-desktop --quick »." : "");
+  renderBackup();
   s.enter.checked = st.sendOnEnter;
   s.searx.value = st.searxngUrl;
   s.embed.value = st.embeddingModel ?? "";
@@ -2732,7 +2743,13 @@ async function openSettings(tab = "general") {
 }
 
 $("#settings-cancel").addEventListener("click", () => el.settings.close());
-s.theme.addEventListener("change", () => applyTheme(s.theme.value as Settings["theme"]));
+const quickSelect = $<HTMLSelectElement>("#s-quick");
+const accentRadios = () => [...document.querySelectorAll<HTMLInputElement>('input[name="accent"]')];
+const pickedAccent = () => (accentRadios().find((r) => r.checked)?.value ?? "teal") as Settings["accent"];
+// Aperçu immédiat du thème et de l'accent ; annulé si les réglages sont fermés sans enregistrer.
+const previewTheme = () => applyTheme(s.theme.value as Settings["theme"], pickedAccent());
+s.theme.addEventListener("change", previewTheme);
+for (const r of accentRadios()) r.addEventListener("change", previewTheme);
 el.settings.addEventListener("close", () => applyTheme(state.settings.theme));
 
 $("#settings-form").addEventListener("submit", async (e) => {
@@ -2750,6 +2767,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
     keepAlive: s.keep.value.trim(),
     thinking: s.thinking.checked,
     theme: s.theme.value as Settings["theme"],
+    accent: pickedAccent(),
+    quickShortcut: quickSelect.value,
     sendOnEnter: s.enter.checked,
     searxngUrl: s.searx.value.trim(),
     embeddingModel: s.embed.value.trim(),
@@ -2788,6 +2807,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
       else if (next.encryptData !== state.settings.encryptData) toast(next.encryptData ? "Données chiffrées" : "Chiffrement désactivé : données déchiffrées");
     }
     const shellChanged = next.shell !== state.settings.shell;
+    if (next.quickShortcut !== state.settings.quickShortcut) api.quickApplyShortcut().catch((e) => toast(errMsg(e), true));
+    if (next.embeddingModel !== state.settings.embeddingModel) embedWarned = false;
     state.settings = next;
     if (shellChanged) state.platform = await api.platform().catch(() => state.platform);
     applyTheme(next.theme);
@@ -2796,7 +2817,6 @@ $("#settings-form").addEventListener("submit", async (e) => {
       state.draft.webSearch = next.webSearchDefault;
     }
     el.settings.close();
-    if (next.embeddingModel !== state.settings.embeddingModel) embedWarned = false;
     if (baseChanged) {
       state.server = null;
       state.models = state.allModels = [];
@@ -2816,6 +2836,16 @@ $("#open-settings").addEventListener("click", () => openSettings());
 $("#models-btn").addEventListener("click", () => openModelsDialog());
 $("#new-chat").addEventListener("click", newChat);
 $("#toggle-sidebar").addEventListener("click", () => el.app.classList.toggle("sidebar-hidden"));
+
+// Anneau de focus réservé au clavier : la dernière modalité d'entrée est notée sur <html>.
+window.addEventListener("pointerdown", () => (document.documentElement.dataset.input = "pointer"), true);
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key === "Tab" || e.key.startsWith("Arrow")) document.documentElement.dataset.input = "keyboard";
+  },
+  true,
+);
 
 // Liens : toujours dans le navigateur du système, jamais dans la WebView.
 document.addEventListener("click", (e) => {
@@ -2973,6 +3003,10 @@ async function init() {
   });
   initDictation({ input: el.input, toast });
   initPopover();
+  // Boutons à icône seule : leur infobulle sert aussi de nom pour les lecteurs d'écran.
+  for (const b of document.querySelectorAll<HTMLElement>("button[title]:not([aria-label])")) {
+    if (!b.textContent?.trim()) b.setAttribute("aria-label", b.title);
+  }
   initModelPicker({
     button: el.modelBtn,
     models: () => state.models,
@@ -3030,6 +3064,24 @@ async function init() {
     openModels: () => openModelsDialog(),
     openSsh: () => openSshDialog(),
     refreshRunning,
+  });
+  // Saisie rapide (raccourci global ou `--quick`) : la question part dans une nouvelle conversation.
+  listen<string>("quick-prompt", (e) => {
+    for (const d of document.querySelectorAll<HTMLDialogElement>("dialog[open]")) d.close();
+    state.mode = "chat";
+    newChat();
+    el.input.value = e.payload;
+    send();
+  });
+  initBackupUi({
+    toast,
+    settings: () => state.settings,
+    patch: async (p) => {
+      const next = { ...state.settings, ...p };
+      await api.saveSettings(next);
+      state.settings = next;
+    },
+    reload: () => location.reload(),
   });
   initModelsUi({
     toast,

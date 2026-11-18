@@ -1,5 +1,18 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
+export type Accent = "teal" | "blue" | "violet" | "rose" | "amber" | "graphite";
+
+export interface BackupStatus {
+  hasPassphrase: boolean;
+  last: number;
+}
+
+export interface RestoreSummary {
+  conversations: number;
+  projects: number;
+  others: number;
+}
+
 export interface Settings {
   /** Serveurs Ollama et identifiant de celui utilisé. */
   servers: Server[];
@@ -43,6 +56,16 @@ export interface Settings {
   ocrModel: string;
   /** L'accueil guidé a été terminé. */
   onboarded: boolean;
+  /** Dossier des sauvegardes chiffrées (vide = aucune). */
+  backupDir: string;
+  backupAuto: boolean;
+  /** Nombre de sauvegardes conservées dans le dossier. */
+  backupKeep: number;
+  /** Date de la dernière sauvegarde (ms) ; tenue par l'application. */
+  lastBackup: number;
+  accent: Accent;
+  /** Raccourci global de la saisie rapide ; vide = aucun. */
+  quickShortcut: string;
   settingsVersion?: number;
 }
 
@@ -407,6 +430,15 @@ export const api = {
   deleteConversation: (id: string) => invoke<void>("delete_conversation", { id }),
   exportConversation: (id: string) => invoke<boolean>("export_conversation", { id }),
   dataDir: () => invoke<string>("data_dir"),
+  /** Enregistre le raccourci global des réglages ; rejette avec la raison s'il est indisponible. */
+  quickApplyShortcut: () => invoke<void>("quick_apply_shortcut"),
+  backupStatus: () => invoke<BackupStatus>("backup_status"),
+  backupSetPassphrase: (passphrase: string) => invoke<void>("backup_set_passphrase", { passphrase }),
+  backupPickDir: () => invoke<string | null>("backup_pick_dir"),
+  /** Renvoie le chemin du fichier écrit. */
+  backupNow: () => invoke<string>("backup_now"),
+  /** `passphrase` vide = celle du trousseau. null = boîte de dialogue annulée. */
+  backupRestore: (passphrase: string) => invoke<RestoreSummary | null>("backup_restore", { passphrase }),
   cancel: (requestId: string) => invoke<void>("cancel_stream", { requestId }),
   platform: () =>
     invoke<{ os: string; shell: string; shellPath: string; shellGuidance: string; version: string }>("platform_info"),

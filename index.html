@@ -90,7 +90,7 @@
         <section id="messages" aria-live="polite"></section>
 
         <footer id="composer-wrap">
-          <div id="activity" class="activity" hidden></div>
+          <div id="activity" class="activity" role="status" hidden></div>
           <div id="ws-menu" class="ws-menu" hidden></div>
           <form id="composer">
             <div id="attachments"></div>
@@ -289,6 +289,25 @@
               </label>
               <label class="check"><input id="s-enter" type="checkbox" /> Entrée pour envoyer (Maj+Entrée = retour ligne)</label>
             </div>
+            <label>Raccourci global de saisie rapide
+              <select id="s-quick">
+                <option value="">Désactivé</option>
+                <option value="CmdOrCtrl+Shift+Space">Ctrl + Maj + Espace</option>
+                <option value="CmdOrCtrl+Alt+Space">Ctrl + Alt + Espace</option>
+                <option value="Alt+Space">Alt + Espace</option>
+                <option value="Super+Shift+O">Super + Maj + O</option>
+              </select>
+              <small class="muted" id="s-quick-hint">Depuis n'importe quelle application, ouvre un champ de saisie : la question part dans une nouvelle conversation.</small>
+            </label>
+            <div class="accent-row" role="radiogroup" aria-label="Couleur d'accent">
+              <span class="muted small">Couleur d'accent</span>
+              <label class="swatch" data-accent="teal" title="Sarcelle"><input type="radio" name="accent" value="teal" aria-label="Sarcelle" /><span></span></label>
+              <label class="swatch" data-accent="blue" title="Bleu"><input type="radio" name="accent" value="blue" aria-label="Bleu" /><span></span></label>
+              <label class="swatch" data-accent="violet" title="Violet"><input type="radio" name="accent" value="violet" aria-label="Violet" /><span></span></label>
+              <label class="swatch" data-accent="rose" title="Rose"><input type="radio" name="accent" value="rose" aria-label="Rose" /><span></span></label>
+              <label class="swatch" data-accent="amber" title="Ambre"><input type="radio" name="accent" value="amber" aria-label="Ambre" /><span></span></label>
+              <label class="swatch" data-accent="graphite" title="Graphite"><input type="radio" name="accent" value="graphite" aria-label="Graphite" /><span></span></label>
+            </div>
           </fieldset>
 
           <fieldset>
@@ -304,6 +323,36 @@
               <input id="vault-key" spellcheck="false" autocomplete="off" class="mono" />
               <button type="button" id="vault-key-action" class="btn-primary sm">Copier</button>
             </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Sauvegarde</legend>
+            <p class="muted small">Copie chiffrée des conversations, projets, assistants et réglages dans un dossier de votre choix : dossier synchronisé (Nextcloud, Syncthing…), partage réseau ou disque externe. Les clés API et les mots de passe n'y figurent jamais.</p>
+            <label>Dossier des sauvegardes
+              <div class="row">
+                <input id="s-backup-dir" readonly placeholder="Aucun dossier choisi" />
+                <button type="button" id="backup-pick" class="btn-ghost sm">Choisir…</button>
+              </div>
+            </label>
+            <label>Phrase secrète
+              <div class="row">
+                <input id="backup-pass" type="password" autocomplete="new-password" spellcheck="false" placeholder="8 caractères au moins" />
+                <button type="button" id="backup-pass-save" class="btn-ghost sm">Enregistrer</button>
+              </div>
+              <small class="muted" id="backup-pass-status"></small>
+            </label>
+            <div class="grid2">
+              <label class="check"><input id="s-backup-auto" type="checkbox" /> Sauvegarde automatique, une fois par jour au démarrage</label>
+              <label>Sauvegardes conservées
+                <input id="s-backup-keep" type="number" min="1" max="365" step="1" />
+              </label>
+            </div>
+            <div class="row">
+              <button type="button" id="backup-now" class="btn-ghost sm">Sauvegarder maintenant</button>
+              <button type="button" id="backup-restore" class="btn-ghost sm">Restaurer une sauvegarde…</button>
+              <span class="muted small" id="backup-status"></span>
+            </div>
+            <p class="muted small">Chiffrement XChaCha20-Poly1305, clé dérivée de la phrase secrète par Argon2id. La phrase est gardée dans le trousseau du système, jamais dans le dossier : sans elle, une sauvegarde est illisible. Notez-la dans votre gestionnaire de mots de passe.</p>
           </fieldset>
 
           <fieldset>
@@ -609,6 +658,6 @@
     </dialog>
 
     <div id="popover" class="popover" hidden></div>
-    <div id="toast" hidden></div>
+    <div id="toast" role="status" aria-live="polite" hidden></div>
   </body>
 </html>

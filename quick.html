@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ollama Desktop : saisie rapide</title>
+  </head>
+  <body class="quick">
+    <form id="quick-form" autocomplete="off">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+      <input id="quick-input" aria-label="Question pour une nouvelle conversation" placeholder="Poser une question dans une nouvelle conversation…" spellcheck="false" autofocus />
+      <kbd>Entrée</kbd>
+    </form>
+    <script type="module" src="/src/quick.ts"></script>
+  </body>
+</html>

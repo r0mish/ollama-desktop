@@ -8,8 +8,11 @@
   --border: rgba(0, 0, 0, 0.1);
   --text: #1f1e1c;
   --muted: #6f6b64;
-  --accent: #0d7a6f;
-  --accent-hover: #0a655c;
+  /* Couleur d'accent : variantes claire (-l) et sombre (-d), remplacées par [data-accent]. */
+  --a-l: #0d7a6f; --a-lh: #0a655c;
+  --a-d: #3cc2b1; --a-dh: #5fd3c4; --a-dt: #062420;
+  --accent: var(--a-l);
+  --accent-hover: var(--a-lh);
   --accent-text: #ffffff;
   --danger: #c62828;
   --code-bg: #1e1e1e;
@@ -32,9 +35,9 @@
     --border: rgba(255, 255, 255, 0.1);
     --text: #ecebe8;
     --muted: #a19d95;
-    --accent: #3cc2b1;
-    --accent-hover: #5fd3c4;
-    --accent-text: #062420;
+    --accent: var(--a-d);
+    --accent-hover: var(--a-dh);
+    --accent-text: var(--a-dt);
     --code-bg: #121211;
     --inline-code: rgba(255, 255, 255, 0.08);
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.3);
@@ -51,9 +54,9 @@
   --border: rgba(255, 255, 255, 0.1);
   --text: #ecebe8;
   --muted: #a19d95;
-  --accent: #3cc2b1;
-  --accent-hover: #5fd3c4;
-  --accent-text: #062420;
+  --accent: var(--a-d);
+  --accent-hover: var(--a-dh);
+  --accent-text: var(--a-dt);
   --code-bg: #121211;
   --inline-code: rgba(255, 255, 255, 0.08);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.3);
@@ -1068,3 +1071,89 @@ button.chip { font: inherit; color: var(--text); }
 button.chip:hover { border-color: var(--accent); }
 code.cite { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
 code.cite:hover { color: var(--accent); }
+
+/* ---------------------------------------------------------------- couleur d'accent */
+[data-accent="teal"] { --a-l: #0d7a6f; --a-lh: #0a655c; --a-d: #3cc2b1; --a-dh: #5fd3c4; --a-dt: #062420; }
+[data-accent="blue"] { --a-l: #2360c5; --a-lh: #1b4fa6; --a-d: #7db0ff; --a-dh: #a0c5ff; --a-dt: #06182f; }
+[data-accent="violet"] { --a-l: #6a48c7; --a-lh: #583aad; --a-d: #b6a0ff; --a-dh: #cbbcff; --a-dt: #1a1038; }
+[data-accent="rose"] { --a-l: #b5306a; --a-lh: #992457; --a-d: #f78fb3; --a-dh: #fbaec8; --a-dt: #3a0b1d; }
+[data-accent="amber"] { --a-l: #9a5600; --a-lh: #7f4700; --a-d: #f2b55a; --a-dh: #f7c97f; --a-dt: #2e1c00; }
+[data-accent="graphite"] { --a-l: #4b5059; --a-lh: #3a3e46; --a-d: #c5cad3; --a-dh: #dde0e6; --a-dt: #16181c; }
+
+.accent-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.accent-row > .muted { margin-right: 4px; }
+fieldset label.swatch { --accent: var(--a-l); display: block; margin: 0; cursor: pointer; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) fieldset label.swatch { --accent: var(--a-d); }
+}
+:root[data-theme="dark"] fieldset label.swatch { --accent: var(--a-d); }
+.swatch input { position: absolute; opacity: 0; width: 0; height: 0; padding: 0; border: 0; }
+.swatch span {
+  display: block; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 3px var(--border);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.swatch:hover span { transform: scale(1.1); }
+.swatch input:checked + span { box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 4px var(--accent); }
+.swatch input:focus-visible + span { box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 4px var(--accent), 0 0 0 6px color-mix(in srgb, var(--accent) 35%, transparent); }
+
+/* ---------------------------------------------------------------- listes déroulantes */
+/* Même flèche partout, au lieu du rendu natif qui change selon le système. */
+select {
+  appearance: none; -webkit-appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%) !important;
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50% !important;
+  background-size: 5px 5px, 5px 5px !important;
+  background-repeat: no-repeat !important;
+  padding-right: 26px !important;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+select:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+select:disabled { cursor: default; opacity: 0.6; }
+
+/* ---------------------------------------------------------------- accessibilité */
+/* Anneau de focus au clavier uniquement ; les champs gardent leur bordure d'accent. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* WebKit affiche l'anneau quand le focus revient par programme (fermeture d'un dialogue) :
+   on ne le garde que si la dernière action vient du clavier (voir input-mode dans main.ts). */
+:root[data-input="pointer"] :focus-visible { outline: none; }
+fieldset :is(input:not([type="checkbox"]), select, textarea):focus-visible, .popover :is(input:not([type="checkbox"]), select, textarea):focus-visible { outline: none; }
+:root[data-input="pointer"] .swatch input:not(:checked):focus-visible + span { box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 3px var(--border); }
+dialog:focus-visible, main:focus-visible, [tabindex="-1"]:focus-visible { outline: none; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+input[readonly] { color: var(--muted); cursor: default; }
+::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* ---------------------------------------------------------------- animations */
+button, .conv, .mp-item, select, input, textarea { transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease; }
+.btn-primary:active, .btn-ghost:active, .chip-btn:active, .send:active { transform: scale(0.97); }
+dialog[open] { animation: dialog-in 0.16s ease-out; }
+dialog[open]::backdrop { animation: fade-in 0.16s ease-out; }
+#toast:not([hidden]) { animation: toast-in 0.18s ease-out; }
+.side-panel:not([hidden]), #git-panel:not([hidden]) { animation: panel-in 0.18s ease-out; }
+@keyframes dialog-in { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes panel-in { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+
+/* Réglage « réduire les animations » du système : plus aucun mouvement. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------- saisie rapide (mini-fenêtre) */
+body.quick { background: var(--bg-elev); }
+#quick-form { display: flex; align-items: center; gap: 12px; height: 100%; padding: 0 16px; border: 1px solid var(--border); }
+#quick-form svg { width: 20px; height: 20px; color: var(--accent); }
+#quick-input { flex: 1; min-width: 0; border: none; background: transparent; outline: none; font-size: 16px; }
+#quick-form kbd { font: 11px var(--font); color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; }

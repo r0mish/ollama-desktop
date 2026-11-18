@@ -111,6 +111,15 @@ Configuration au **format de Claude Desktop** (Réglages → MCP), transports **
 ### Suivi de l'agent
 Barre d'activité (attente du modèle, réflexion, rédaction, outil en cours, approbation), chronomètre et étapes ; **nouvel essai automatique** si Ollama est occupé (503) ou redémarre ; délais adaptés à l'inférence locale (10 min pour le chargement du modèle et la lecture de l'invite) ; **relance automatique** si l'agent annonce une action sans l'exécuter ; **consommation de tokens** par jour et par modèle (Réglages → Utilisation).
 
+### Saisie rapide
+Un **raccourci global** (Réglages → Général → Interface, désactivé par défaut) ouvre un champ de saisie par-dessus n'importe quelle application : `Entrée` envoie la question dans une nouvelle conversation, `Échap` referme. Sous **Wayland**, une application ne peut pas capter de raccourci global : associez un raccourci de votre bureau (GNOME, KDE…) à la commande `ollama-desktop --quick`, qui prévient l'instance déjà lancée par un socket privé (`$XDG_RUNTIME_DIR`).
+
+### Sauvegarde chiffrée
+Réglages → Général → Sauvegarde : copie des conversations, projets, assistants et réglages dans un dossier de votre choix, par exemple un dossier synchronisé par **Nextcloud** ou **Syncthing**, un partage réseau ou un disque externe. Un fichier `.odbak` par sauvegarde, **chiffré** (XChaCha20-Poly1305, clé dérivée d'une phrase secrète par Argon2id) : le dossier de destination n'a pas à être de confiance. Sauvegarde manuelle ou **automatique une fois par jour**, rotation des anciennes, restauration depuis l'application (les éléments de même identifiant sont remplacés, les autres conservés). Les clés API, mots de passe et la clé de chiffrement locale n'y figurent jamais.
+
+### Apparence et accessibilité
+Thème clair, sombre ou celui du système ; six **couleurs d'accent** ; animations discrètes, coupées si le système demande de réduire les animations ; navigation complète au clavier avec indicateur de focus visible ; boutons à icône nommés pour les lecteurs d'écran.
+
 ### Raccourcis
 `Ctrl/⌘+N` nouvelle conversation · `Ctrl/⌘+1` / `2` Chat / Code · `Ctrl/⌘+M` modèles · `Ctrl/⌘+K` palette de commandes · `Ctrl/⌘+B` barre latérale · `Ctrl/⌘+,` réglages · `Ctrl/⌘+G` panneau Git · `Ctrl/⌘+Maj+D` dictée · `Échap` arrêter
 
@@ -124,6 +133,7 @@ Barre d'activité (attente du modèle, réflexion, rédaction, outil en cours, a
 | HTTP en clair | Accepté pour `localhost` et le réseau privé (IP RFC 1918, CGNAT/Tailscale, IPv6 ULA, `.lan`, `.local`, `.home.arpa`, noms sans domaine), refusé vers Internet. Un avertissement s'affiche si une clé API transiterait en clair. |
 | Clé API (facultative) | **Trousseau du système** (Keychain, Credential Manager, Secret Service/KWallet). Repli : variable `OLLAMA_API_KEY`. |
 | Conversations | Fichiers JSON locaux, **chiffrés par défaut** (XChaCha20-Poly1305, clé de 256 bits dans le trousseau) : conversations, index, projets et `mcp.json`. Clé de récupération à sauvegarder (KeePassXC, Bitwarden…). |
+| Sauvegardes | Facultatives, vers un dossier que vous choisissez. Chiffrées par une phrase secrète (Argon2id, 64 Mio, puis XChaCha20-Poly1305) gardée dans le trousseau, jamais dans le dossier. Aucun service tiers. |
 | WebView | Aucune ressource distante (aucun pixel de suivi), HTML assaini par DOMPurify, liens ouverts dans le navigateur du système. |
 | Agent de code | Dossiers autorisés uniquement via la boîte de dialogue native ou une connexion SSH validée ; écritures et commandes soumises à approbation par défaut. ⚠️ Le mode **Autonome** exécute les commandes avec vos droits sans confirmation. |
 
@@ -216,6 +226,8 @@ src/                    Interface (TypeScript, sans framework)
   projects-ui.ts        Projets (consignes, fichiers de référence)
   dictation.ts          Dictée vocale
   ssh-ui.ts, git-ui.ts  Serveurs SSH, panneau Git
+  backup-ui.ts          Sauvegarde chiffrée (réglages)
+  quick.ts              Mini-fenêtre de saisie rapide (quick.html)
 src-tauri/src/
   lib.rs                Commandes Tauri, trousseau, annulation, PDF
   tunnel.rs             Tunnels SSH vers un Ollama distant
@@ -226,6 +238,8 @@ src-tauri/src/
   mcp.rs                Client MCP stdio / HTTP
   storage.rs            Stockage JSON atomique, export Markdown, recherche plein texte
   vault.rs              Chiffrement local (XChaCha20-Poly1305, clé dans le trousseau)
+  backup.rs             Sauvegarde chiffrée par phrase secrète (Argon2id), rotation
+  quick.rs              Saisie rapide : raccourci global, mini-fenêtre, `--quick`
   textsearch.rs         Recherche locale : plein texte, BM25
   embed.rs              Recherche sémantique : index d'embeddings chiffré, fusion avec BM25
   pdfscan.rs            PDF scannés : images de page pour un modèle vision

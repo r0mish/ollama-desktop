@@ -1,9 +1,11 @@
 mod audio;
+mod backup;
 mod embed;
 mod git;
 mod mcp;
 mod ollama;
 mod pdfscan;
+mod quick;
 mod shell;
 mod ssh;
 mod storage;
@@ -131,7 +133,11 @@ fn get_settings(app: AppHandle) -> CmdResult<Settings> {
 }
 
 #[tauri::command]
-async fn save_settings(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, settings: Settings) -> CmdResult<()> {
+async fn save_settings(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, mut settings: Settings) -> CmdResult<()> {
+    // La date de dernière sauvegarde appartient au backend : l'interface peut en avoir une copie périmée.
+    if let Ok(disk) = storage::load_settings(&app) {
+        settings.last_backup = disk.last_backup;
+    }
     if settings.servers.is_empty() {
         return Err("Au moins un serveur Ollama est nécessaire".into());
     }
@@ -792,6 +798,144 @@ async fn pdf_page_images(data_base64: String) -> CmdResult<pdfscan::PageImages> 
         .map_err(|e| e.to_string())?
 }
 
+// ------------------------------------------------------------------ sauvegarde chiffrée
+
+const BACKUP_KEYRING_USER: &str = "backup-passphrase";
+
+fn backup_entry() -> CmdResult<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, BACKUP_KEYRING_USER).map_err(|e| e.to_string())
+}
+
+/// Phrase secrète des sauvegardes, gardée dans le trousseau du système.
+fn backup_passphrase() -> Option<String> {
+    backup_entry().ok()?.get_password().ok().filter(|p| !p.is_empty())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupStatus {
+    has_passphrase: bool,
+    /// Date de la dernière sauvegarde (ms), 0 si aucune.
+    last: u64,
+}
+
+#[tauri::command]
+fn backup_status(app: AppHandle) -> BackupStatus {
+    BackupStatus { has_passphrase: backup_passphrase().is_some(), last: storage::load_settings(&app).map(|s| s.last_backup).unwrap_or(0) }
+}
+
+#[tauri::command]
+fn backup_set_passphrase(passphrase: String) -> CmdResult<()> {
+    if passphrase.chars().count() < 8 {
+        return Err("La phrase secrète doit compter au moins 8 caractères".into());
+    }
+    backup_entry()?
+        .set_password(&passphrase)
+        .map_err(|e| format!("Impossible d'écrire dans le trousseau du système : {e}"))
+}
+
+#[tauri::command]
+async fn backup_pick_dir(app: AppHandle) -> CmdResult<Option<String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_title("Dossier des sauvegardes").pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let Some(path) = rx.await.map_err(|e| e.to_string())? else { return Ok(None) };
+    Ok(Some(path.into_path().map_err(|e| e.to_string())?.display().to_string()))
+}
+
+/// Écrit une sauvegarde chiffrée dans le dossier configuré et renvoie son chemin.
+fn run_backup(app: &AppHandle) -> CmdResult<String> {
+    let mut settings = storage::load_settings(app)?;
+    let dir = settings.backup_dir.trim().to_string();
+    if dir.is_empty() {
+        return Err("Choisissez d'abord le dossier des sauvegardes".into());
+    }
+    let passphrase = backup_passphrase().ok_or("Définissez d'abord la phrase secrète des sauvegardes")?;
+    let now = now_ms();
+    let sealed = backup::seal(storage::backup_entries(app)?, &passphrase, now)?;
+    let path = backup::write(std::path::Path::new(&dir), &sealed, now / 1000, settings.backup_keep as usize)?;
+    settings.last_backup = now;
+    storage::save_settings(app, &settings)?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+async fn backup_now(app: AppHandle) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || run_backup(&app)).await.map_err(|e| e.to_string())?
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreSummary {
+    conversations: usize,
+    projects: usize,
+    /// Autres fichiers restaurés (réglages, assistants, serveurs SSH…).
+    others: usize,
+}
+
+/// Restaure une sauvegarde choisie par l'utilisateur. Les éléments de même identifiant sont
+/// remplacés, les autres conservés. `None` si la boîte de dialogue a été annulée.
+#[tauri::command]
+async fn backup_restore(app: AppHandle, passphrase: String) -> CmdResult<Option<RestoreSummary>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Restaurer une sauvegarde")
+        .add_filter("Sauvegarde Ollama Desktop", &[backup::EXTENSION])
+        .pick_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let Some(path) = rx.await.map_err(|e| e.to_string())? else { return Ok(None) };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let passphrase = if passphrase.is_empty() { backup_passphrase().ok_or("Saisissez la phrase secrète de cette sauvegarde")? } else { passphrase };
+        let files = backup::open(&data, &passphrase)?;
+        let mut sum = RestoreSummary { conversations: 0, projects: 0, others: 0 };
+        for (name, bytes) in files {
+            if storage::restore_entry(&app, &name, &bytes)? {
+                match name.split_once('/') {
+                    Some(("conversations", _)) => sum.conversations += 1,
+                    Some(("projects", _)) => sum.projects += 1,
+                    _ => sum.others += 1,
+                }
+            }
+        }
+        storage::drop_index(&app)?;
+        Ok(Some(sum))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ------------------------------------------------------------------ saisie rapide
+
+/// Applique le raccourci global des réglages ; l'erreur éventuelle est à afficher.
+#[tauri::command]
+fn quick_apply_shortcut(app: AppHandle) -> CmdResult<()> {
+    quick::apply_shortcut(&app, &storage::load_settings(&app)?.quick_shortcut)
+}
+
+#[tauri::command]
+fn quick_submit(app: AppHandle, text: String) -> CmdResult<()> {
+    quick::submit(&app, &text)
+}
+
+/// `blurred` : la mini-fenêtre a perdu le focus (ignoré juste après son affichage).
+#[tauri::command]
+fn quick_hide(app: AppHandle, blurred: bool) {
+    if blurred {
+        quick::blurred(&app);
+    } else {
+        quick::hide(&app);
+    }
+}
+
 // ------------------------------------------------------------------ MCP
 
 #[tauri::command]
@@ -887,9 +1031,10 @@ async fn install_update(app: AppHandle, on_progress: Channel<serde_json::Value>)
     app.restart()
 }
 
-/// Mode « askpass » (voir `ssh::askpass_main`) : code de sortie, ou None lors d'un lancement normal.
+/// Modes sans interface : « askpass » (voir `ssh::askpass_main`) et `--quick` adressé à une
+/// instance déjà lancée. Renvoie le code de sortie, ou None lors d'un lancement normal.
 pub fn askpass() -> Option<i32> {
-    ssh::askpass_main()
+    ssh::askpass_main().or_else(|| quick::signal_running_instance().then_some(0))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -904,6 +1049,7 @@ pub fn run() {
     let app = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(Streams::default())
         .manage(Dictation::default())
         .manage(Arc::new(McpManager::default()))
@@ -918,6 +1064,23 @@ pub fn run() {
                     Err(e) => *vault::LAST_ERROR.lock().unwrap() = Some(e),
                 }
             }
+            // Saisie rapide : raccourci global (s'il est défini) et écoute de `--quick`.
+            if let Ok(s) = storage::load_settings(app.handle()) {
+                if let Err(e) = quick::apply_shortcut(app.handle(), &s.quick_shortcut) {
+                    eprintln!("{e}");
+                }
+            }
+            quick::listen(app.handle());
+            // Sauvegarde automatique : une fois par jour, au démarrage.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let Ok(s) = storage::load_settings(&handle) else { return };
+                if s.backup_auto && !s.backup_dir.trim().is_empty() && now_ms().saturating_sub(s.last_backup) > 20 * 3600 * 1000 {
+                    if let Err(e) = run_backup(&handle) {
+                        eprintln!("sauvegarde automatique impossible : {e}");
+                    }
+                }
+            });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mgr = handle.state::<Arc<McpManager>>().inner().clone();
@@ -966,6 +1129,14 @@ pub fn run() {
             touch_workspace,
             process_document,
             pdf_page_images,
+            quick_apply_shortcut,
+            quick_submit,
+            quick_hide,
+            backup_status,
+            backup_set_passphrase,
+            backup_pick_dir,
+            backup_now,
+            backup_restore,
             mcp_get_config,
             mcp_save_config,
             mcp_restart,
@@ -1009,7 +1180,14 @@ pub fn run() {
         .expect("erreur au lancement de l'application");
 
     app.run(|handle, event| {
+        // Fermer la fenêtre principale quitte l'application, même si la mini-fenêtre existe encore.
+        if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } = &event {
+            if label == "main" {
+                handle.exit(0);
+            }
+        }
         if let tauri::RunEvent::Exit = event {
+            quick::cleanup();
             // Arrêt propre des serveurs MCP (processus enfants).
             let mgr = handle.state::<Arc<McpManager>>().inner().clone();
             tauri::async_runtime::block_on(mgr.shutdown());

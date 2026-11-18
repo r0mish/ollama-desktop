@@ -1,6 +1,6 @@
 [package]
 name = "ollama-desktop"
-version = "0.6.0"
+version = "0.7.0"
 description = "Client de bureau léger et respectueux de la vie privée pour Ollama"
 authors = ["r0mish"]
 license = "MIT"
@@ -37,6 +37,11 @@ lopdf = { version = "0.42", default-features = false }
 png = "0.18"
 cpal = "0.18"
 chacha20poly1305 = "0.10"
+# Sauvegarde chiffrée : dérivation de clé depuis une phrase secrète, compression.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+flate2 = "1"
+# Saisie rapide : raccourci global.
+tauri-plugin-global-shortcut = "2"
 
 [dev-dependencies]
 # Faux serveur Ollama des tests d'intégration du client HTTP.
