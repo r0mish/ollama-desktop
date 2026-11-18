@@ -244,6 +244,18 @@ const PID_MARKER: &str = "__MDPID__";
 /// Exécute `script` avec `sh` sur l'hôte distant.
 /// Si `cancel` se déclenche (ou au délai), le groupe de processus distant est tué.
 pub async fn exec(h: &SshHost, script: &str, stdin: Option<Vec<u8>>, timeout: Duration, cancel: Option<Arc<Notify>>) -> R<Output> {
+    exec_live(h, script, stdin, timeout, cancel, None).await
+}
+
+/// Comme `exec`, en relayant les sorties au fil de l'eau (`live`).
+pub async fn exec_live(
+    h: &SshHost,
+    script: &str,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    cancel: Option<Arc<Notify>>,
+    live: Option<crate::workspace::Live>,
+) -> R<Output> {
     validate(h)?;
     // $$ est le PID du shell qui exécute le script, chef de session côté sshd :
     // il sert à tuer toute la commande en cas d'annulation.
@@ -262,24 +274,33 @@ pub async fn exec(h: &SshHost, script: &str, stdin: Option<Vec<u8>>, timeout: Du
             let _ = si.shutdown().await;
         });
     }
-    let mut out = child.stdout.take().unwrap();
+    let out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_task = {
         let buf = err_buf.clone();
+        let live = live.clone();
         tokio::spawn(async move {
+            let mut sink = crate::workspace::LiveSink::new(live);
+            // La première ligne (marqueur du PID distant) n'est pas relayée.
+            let mut marker_done = false;
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err.read(&mut chunk).await {
                 if n == 0 {
                     break;
                 }
                 buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+                if marker_done {
+                    sink.push(&chunk[..n]);
+                } else if let Some(nl) = chunk[..n].iter().position(|&b| b == b'\n') {
+                    marker_done = true;
+                    sink.push(&chunk[nl + 1..n]);
+                }
             }
         })
     };
     let run = async {
-        let mut o = Vec::new();
-        let _ = out.read_to_end(&mut o).await;
+        let o = crate::workspace::read_live(out, live).await;
         let status = child.wait().await;
         let _ = err_task.await;
         (o, status)

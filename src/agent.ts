@@ -45,6 +45,12 @@ const SYSTEM_ACCESS_PROMPT = `System access is enabled for this session: list_fi
 - After changing a service configuration, validate it if a check command exists (nginx -t, sshd -t, fail2ban-client -t, visudo -c…) and tell the user how to reload the service instead of restarting it yourself, unless asked.
 - Writing root-owned files requires the connected user to have write permission (e.g. connected as root); if access is denied, explain it to the user.`;
 
+const PLAN_PROMPT = `PLAN MODE is active: you only have read-only tools. Do NOT try to modify files or run commands.
+Explore the project as needed, then answer with a concrete, numbered implementation plan: the files to change and how, the commands to run, the risks and how you will verify the result.
+End by telling the user they can click « Exécuter le plan » to let you carry it out.`;
+
+const SUDO_PROMPT = `sudo: when a command needs root, call sudo directly in the command (e.g. "sudo systemctl reload nginx"); the user is then asked for approval and for the sudo password. Never wrap sudo in a script, a subshell or "sh -c", and never ask for the password yourself.`;
+
 /** Contexte additionnel : consignes du dossier (AGENTS.md…) et projet de la conversation. */
 export interface PromptExtras {
   instructions?: InstructionFile[];
@@ -82,6 +88,8 @@ export function systemPrompt(conv: Conversation, settings: Settings, platform: P
     const instr = instructionsPrompt(extras.instructions ?? []);
     if (instr) parts.push(instr);
     if (conv.systemAccess) parts.push(SYSTEM_ACCESS_PROMPT);
+    if (platform.remote || platform.os !== "windows") parts.push(SUDO_PROMPT);
+    if (conv.permissionMode === "plan") parts.push(PLAN_PROMPT);
   }
   if (extras.project) parts.push(projectPrompt(extras.project, extras.projectFiles));
   const user = (conv.systemPrompt ?? settings.systemPrompt)?.trim();
@@ -162,6 +170,11 @@ export function toApiMessages(conv: Conversation, system: string): ApiMessage[] 
  * `outside` : le chemin sort du dossier de projet (accès système) — écritures toujours approuvées
  * (sauf mode Autonome), lectures approuvées en mode « Tout demander ».
  */
+/** La commande appelle-t-elle sudo ? (approbation systématique, mot de passe demandé) */
+export function usesSudo(tc: { name: string; arguments: string }): boolean {
+  return tc.name === "run_command" && /(^|[\s;&|(`])sudo(\s|$)/.test(str(parse(tc.arguments).command));
+}
+
 export function needsApproval(risk: Risk, name: string, mode: PermissionMode, settings: Settings, outside = false): boolean {
   if (mode === "auto") return false;
   if (outside && (risk === "write" || (risk === "read" && mode === "ask"))) return true;
@@ -269,8 +282,9 @@ export function toolCardHtml(tc: ToolCallRec, risk: Risk | undefined): string {
       ? `<div class="tool-label">Arguments</div><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre>`
       : "";
   const result = tc.result ? `<div class="tool-label">Résultat</div><pre>${escapeHtml(tc.result.length > 20000 ? tc.result.slice(0, 20000) + "\n…" : tc.result)}</pre>` : "";
-  const details = argsBlock || result ? `<details${tc.status === "error" ? " open" : ""}><summary>Détails</summary>${argsBlock}${result}</details>` : "";
   const diff = tc.diff ? diffHtml(tc.diff) : "";
+  // Sortie de la commande en cours : les dernières lignes, au fil de l'eau.
+  const live = tc.status === "running" && tc.live ? `<pre class="tool-live">${escapeHtml(tc.live.split("\n").slice(-14).join("\n"))}</pre>` : "";
   let approval = "";
   if (tc.status === "pending") {
     const always =
@@ -281,9 +295,17 @@ export function toolCardHtml(tc: ToolCallRec, risk: Risk | undefined): string {
           : "";
     const question = tc.outside
       ? `${risk === "write" ? "Modifier" : "Lire"} <strong>hors du projet</strong> : ${code(tc.outside, 200)} ?`
-      : risk === "exec" ? "Exécuter cette commande ?" : risk === "write" ? "Appliquer cette modification ?" : "Autoriser cet appel ?";
-    approval = `<div class="tool-approve${tc.outside ? " outside" : ""}">
+      : tc.sudo ? "Exécuter cette commande <strong>en tant que root (sudo)</strong> ?" : risk === "exec" ? "Exécuter cette commande ?" : risk === "write" ? "Appliquer cette modification ?" : "Autoriser cet appel ?";
+    const sudo =
+      tc.sudo === "ask"
+        ? `<div class="sudo-row"><input type="password" class="sudo-pw" placeholder="Mot de passe sudo (vide si sudo n'en demande pas)" autocomplete="off" />
+            <label class="check small"><input type="checkbox" class="sudo-keep" /> Retenir jusqu'à la fermeture de l'application</label></div>`
+        : tc.sudo === "cached"
+          ? `<div class="sudo-row small muted">Mot de passe sudo retenu pour cette session. <button class="btn-ghost sm" data-forget-sudo>Oublier</button></div>`
+          : "";
+    approval = `<div class="tool-approve${tc.outside || tc.sudo ? " outside" : ""}">
       <span>${question}</span>
+      ${sudo}
       <span class="row">
         <button class="btn-ghost sm danger" data-approve="deny">Refuser</button>
         ${always}
@@ -292,8 +314,17 @@ export function toolCardHtml(tc: ToolCallRec, risk: Risk | undefined): string {
     </div>`;
   }
   const spinner = tc.status === "running" ? '<span class="spinner"></span>' : "";
+  const status = tc.undone ? "Annulé" : STATUS_LABEL[tc.status];
+  const head = `${icon}<span class="tool-title">${html}</span>${tc.outside ? '<span class="badge-outside" title="Fichier en dehors du dossier de projet (accès système)">hors projet</span>' : ""}${spinner}<span class="tool-status">${status}</span>`;
+  // Carte compacte : l'en-tête se déplie pour montrer les arguments et le résultat.
+  if ((argsBlock || result) && !approval && !live) {
+    return `<details class="tool ${tc.status}${tc.undone ? " undone" : ""}" data-tc="${escapeHtml(tc.id)}"${tc.status === "error" ? " open" : ""}>
+      <summary class="tool-head">${head}<svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></summary>
+      ${diff}<div class="tool-body">${argsBlock}${result}</div>
+    </details>`;
+  }
   return `<div class="tool ${tc.status}" data-tc="${escapeHtml(tc.id)}">
-    <div class="tool-head">${icon}<span class="tool-title">${html}</span>${tc.outside ? '<span class="badge-outside" title="Fichier en dehors du dossier de projet (accès système)">hors projet</span>' : ""}${spinner}<span class="tool-status">${STATUS_LABEL[tc.status]}</span></div>
-    ${diff}${details}${approval}
+    <div class="tool-head">${head}</div>
+    ${diff}${live}${approval}
   </div>`;
 }

@@ -1005,3 +1005,43 @@ kbd {
 .msg.has-alt { max-width: none; }
 @media (max-width: 900px) { .compare { grid-template-columns: 1fr; } }
 .welcome.wide { max-width: 760px; }
+
+/* ---------------------------------------------------------------- agent : cartes compactes, sortie en direct, sudo, fichiers modifiés */
+details.tool > summary.tool-head { cursor: pointer; list-style: none; padding: 6px 12px; }
+details.tool > summary.tool-head::-webkit-details-marker { display: none; }
+details.tool > summary .chev { width: 14px; height: 14px; color: var(--muted); flex-shrink: 0; transition: transform 0.15s; }
+details.tool[open] > summary .chev { transform: rotate(180deg); }
+details.tool > summary:hover { background: var(--bg-hover); }
+.tool-body { border-top: 1px solid var(--border); padding: 4px 12px 8px; }
+.tool.undone .tool-title { text-decoration: line-through; color: var(--muted); }
+.tool.undone .diff { opacity: 0.5; }
+.tool-live {
+  margin: 0 !important; border-radius: 0 !important; border-top: 1px solid var(--border);
+  max-height: 260px; overflow: hidden; display: flex; flex-direction: column-reverse; white-space: pre-wrap;
+}
+.sudo-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; width: 100%; margin: 6px 0; font-weight: 400; }
+.sudo-row .sudo-pw {
+  flex: 1; min-width: 220px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font-size: 13.5px; outline: none;
+}
+.sudo-row .sudo-pw:focus { border-color: var(--accent); }
+.sudo-row .check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 400; }
+.tool-approve { flex-wrap: wrap; }
+.msg-actions [data-undo-turn] { margin-left: 6px; color: var(--muted); }
+.msg-actions [data-undo-turn].confirm { background: var(--danger); color: #fff; }
+
+.side-panel {
+  position: absolute; top: 52px; right: 0; bottom: 0; width: min(520px, 100%);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--bg-elev); border-left: 1px solid var(--border); box-shadow: -8px 0 24px rgba(0, 0, 0, 0.08);
+  z-index: 20; font-size: 13.5px;
+}
+#changes-list { max-height: 34%; overflow-y: auto; border-bottom: 1px solid var(--border); padding: 4px 0; }
+#changes-list .git-file.open { background: var(--bg-active); }
+#changes-diff { flex: 1; overflow: auto; }
+#changes-diff .diff { margin: 0; border-radius: 0; }
+.chg-stat { font: 12px var(--mono); white-space: nowrap; }
+.chg-stat .add { color: #2ea043; font-weight: 600; } .chg-stat .del { color: var(--danger); font-weight: 600; }
+.chg-step { padding: 6px 12px 2px; }
+.changes-btn svg { color: #d29922; }
+#topbar > .changes-btn { min-width: 0; flex-shrink: 0; }

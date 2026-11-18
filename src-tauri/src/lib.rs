@@ -372,6 +372,16 @@ fn tool_outside(app: AppHandle, ctx: ToolContext, name: String, arguments: Strin
     tools::outside(&ctx, &storage::load_workspaces(&app), &storage::load_ssh_hosts(&app), &name, &arguments)
 }
 
+/// Appel d'outil à exécuter.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallReq {
+    name: String,
+    arguments: String,
+    /// Mot de passe sudo saisi pour cette commande (jamais enregistré).
+    sudo_password: Option<String>,
+}
+
 #[tauri::command]
 async fn run_tool(
     app: AppHandle,
@@ -379,27 +389,38 @@ async fn run_tool(
     mcp: State<'_, Arc<McpManager>>,
     request_id: String,
     ctx: ToolContext,
-    name: String,
-    arguments: String,
+    call: ToolCallReq,
+    on_output: Channel<String>,
 ) -> CmdResult<ToolOutput> {
+    let ToolCallReq { name, arguments, sudo_password } = call;
     let settings = storage::load_settings(&app)?;
     let approved = storage::load_workspaces(&app);
     let hosts = storage::load_ssh_hosts(&app);
     let project = ctx.project.as_deref().and_then(|id| storage::load_project(&app, id).ok());
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project };
+    let live: workspace::Live = Arc::new(move |text| {
+        let _ = on_output.send(text);
+    });
+    let sudo = sudo_password.filter(|p| !p.is_empty() && !p.contains(['\n', '\r']));
+    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project, live: Some(live), sudo };
     let out = if name == "run_command" {
         // La commande gère elle-même l'annulation (arrêt du groupe de processus).
         tools::run(&ctx, env, &name, &arguments).await
     } else {
         tokio::select! {
             o = tools::run(&ctx, env, &name, &arguments) => o,
-            _ = cancel.notified() => ToolOutput { content: "Annulé par l'utilisateur".into(), is_error: true, diff: None },
+            _ = cancel.notified() => ToolOutput { content: "Annulé par l'utilisateur".into(), is_error: true, ..Default::default() },
         }
     };
     streams.0.lock().unwrap().remove(&request_id);
     Ok(out)
+}
+
+/// Annule une modification de fichier faite par l'agent (contenu précédent, ou suppression d'un fichier créé).
+#[tauri::command]
+async fn restore_file(app: AppHandle, ctx: ToolContext, path: String, before: Option<String>) -> CmdResult<()> {
+    tools::restore(&ctx, &storage::load_workspaces(&app), &storage::load_ssh_hosts(&app), &path, before.as_deref()).await
 }
 
 // ------------------------------------------------------------------ dossiers de projet
@@ -872,6 +893,7 @@ pub fn run() {
             preview_tool,
             tool_outside,
             run_tool,
+            restore_file,
             pick_workspace,
             list_workspaces,
             forget_workspace,

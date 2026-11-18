@@ -52,7 +52,12 @@ Comme dans Claude Desktop : des conversations regroupées qui partagent des **co
 ### Agent de code (onglet **Code**)
 Un agent façon Claude Code, avec un modèle local gérant les outils (`devstral-small-2`, `qwen3-coder`, `qwen3`, `gpt-oss`…) :
 - Outils : `list_files`, `read_file`, `search_files` (regex, respecte `.gitignore`), `edit_file`, `write_file`, `run_command`, `git_status`, `git_diff`, `git_log`
-- **Diff coloré** avant chaque modification, approbation commande par commande ; trois niveaux : **Tout demander**, **Modifs auto**, **Autonome**
+- **Diff coloré** avant chaque modification, approbation commande par commande ; quatre niveaux : **Plan** (lecture seule), **Tout demander**, **Modifs auto**, **Autonome**
+- **Mode plan** : l'agent explore le projet avec des outils en lecture seule et propose un plan ; « Exécuter le plan » le lance ensuite, chaque action restant soumise à votre accord
+- **Sortie des commandes en direct** pendant leur exécution, en local comme en SSH
+- **sudo** : une commande qui appelle `sudo` demande toujours votre accord (même en mode Autonome) et le mot de passe. Celui-ci valide sudo par l'entrée standard du shell, qui est fermée avant que la commande ne démarre : il n'apparaît ni dans la commande, ni dans l'environnement, ni sur le disque, ni dans la conversation, et la commande de l'agent ne peut pas le lire. Il peut être retenu en mémoire jusqu'à la fermeture de l'application
+- **Annuler les modifications** : un clic sous la réponse remet les fichiers dans l'état d'avant le dernier tour de l'agent (fichiers créés supprimés)
+- **Fichiers modifiés** : panneau latéral listant les fichiers touchés pendant la session, avec leurs diffs successifs
 - Accès **confiné au dossier choisi** ; **accès système** optionnel (fichiers hors projet, ex. `/etc/fail2ban/jail.local`) avec approbation systématique
 - **Fichiers de consignes** lus automatiquement : `AGENTS.md`, `OLLAMA.md` ou `CLAUDE.md` ; génération d'`AGENTS.md` par l'agent
 - **Serveurs SSH** : l'agent travaille directement sur un serveur via le client OpenSSH du système (alias, `ProxyJump`, clés de `~/.ssh/config`, ControlMaster), vérification des empreintes d'hôte. Détail ci-dessous

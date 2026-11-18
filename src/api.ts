@@ -109,6 +109,14 @@ export interface ToolCallRec {
   diff?: string;
   /** Chemin absolu hors du dossier de projet (accès système). */
   outside?: string;
+  /** Fin de la sortie d'une commande en cours (affichage en direct, non conservé). */
+  live?: string;
+  /** La commande utilise sudo : mot de passe à demander, ou déjà retenu pour la session. */
+  sudo?: "ask" | "cached";
+  /** État du fichier avant la modification, tant qu'elle peut être annulée. */
+  undo?: { path: string; before: string | null };
+  /** Modification annulée par l'utilisateur. */
+  undone?: boolean;
 }
 
 export interface Message {
@@ -168,7 +176,8 @@ export interface Assistant {
 }
 
 export type Kind = "chat" | "code";
-export type PermissionMode = "ask" | "acceptEdits" | "auto";
+/** « plan » : lecture seule, l'agent propose un plan avant toute modification. */
+export type PermissionMode = "plan" | "ask" | "acceptEdits" | "auto";
 
 export interface Conversation {
   id: string;
@@ -283,6 +292,7 @@ export interface ToolOutput {
   content: string;
   isError: boolean;
   diff: string | null;
+  undo: { path: string; before: string | null } | null;
 }
 
 export interface McpServerStatus {
@@ -452,8 +462,23 @@ export const api = {
     invoke<string | null>("tool_outside", { ctx, name, arguments: args }),
   previewTool: (ctx: ToolContext, name: string, args: string) =>
     invoke<string | null>("preview_tool", { ctx, name, arguments: args }),
-  runTool: (requestId: string, ctx: ToolContext, name: string, args: string) =>
-    invoke<ToolOutput>("run_tool", { requestId, ctx, name, arguments: args }),
+  runTool(
+    requestId: string,
+    ctx: ToolContext,
+    name: string,
+    args: string,
+    opts: { sudoPassword?: string; onOutput?: (text: string) => void } = {},
+  ): Promise<ToolOutput> {
+    const channel = new Channel<string>();
+    if (opts.onOutput) channel.onmessage = opts.onOutput;
+    return invoke<ToolOutput>("run_tool", {
+      requestId,
+      ctx,
+      call: { name, arguments: args, sudoPassword: opts.sudoPassword ?? null },
+      onOutput: channel,
+    });
+  },
+  restoreFile: (ctx: ToolContext, path: string, before: string | null) => invoke<void>("restore_file", { ctx, path, before }),
 
   pickWorkspace: () => invoke<string | null>("pick_workspace"),
   listWorkspaces: () => invoke<string[]>("list_workspaces"),

@@ -46,6 +46,16 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Diff unifié à afficher dans l'interface (écritures de fichiers).
     pub diff: Option<String>,
+    /// État du fichier avant l'écriture, pour annuler la modification.
+    pub undo: Option<Undo>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Undo {
+    pub path: String,
+    /// Contenu précédent ; `None` si le fichier n'existait pas (l'annulation le supprime).
+    pub before: Option<String>,
 }
 
 fn func(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -304,12 +314,25 @@ pub struct RunEnv<'a> {
     pub mcp: &'a McpManager,
     pub cancel: Arc<Notify>,
     pub project: Option<crate::storage::Project>,
+    /// Sortie des commandes relayée à l'interface au fil de l'eau.
+    pub live: Option<crate::workspace::Live>,
+    /// Mot de passe sudo saisi pour cette commande.
+    pub sudo: Option<String>,
+}
+
+/// Annule une écriture de l'agent : remet le contenu précédent, ou supprime le fichier créé.
+pub async fn restore(ctx: &ToolContext, approved: &[String], hosts: &[SshHost], path: &str, before: Option<&str>) -> R<()> {
+    let (t, path) = target_for(ctx, approved, hosts, path)?;
+    match before {
+        Some(content) => t.write_file(&path, content).await.map(|_| ()),
+        None => t.remove_file(&path).await,
+    }
 }
 
 pub async fn run(ctx: &ToolContext, env: RunEnv<'_>, name: &str, arguments: &str) -> ToolOutput {
     match run_inner(ctx, env, name, arguments).await {
         Ok(o) => o,
-        Err(e) => ToolOutput { content: format!("Erreur : {e}"), is_error: true, diff: None },
+        Err(e) => ToolOutput { content: format!("Erreur : {e}"), is_error: true, ..Default::default() },
     }
 }
 
@@ -338,18 +361,21 @@ async fn run_inner(ctx: &ToolContext, env: RunEnv<'_>, name: &str, arguments: &s
         }
         "write_file" => {
             let (t, path) = target_at(s(&args, "path")?)?;
+            let before = t.snapshot(&path).await;
             let (msg, diff) = t.write_file(&path, s(&args, "content")?).await?;
-            Ok(ToolOutput { content: msg, is_error: false, diff: Some(diff) })
+            Ok(ToolOutput { content: msg, is_error: false, diff: Some(diff), undo: before.ok().map(|before| Undo { path, before }) })
         }
         "edit_file" => {
             let (t, path) = target_at(s(&args, "path")?)?;
+            let before = t.snapshot(&path).await;
             let (msg, diff) = t.edit_file(&path, s(&args, "old_string")?, s(&args, "new_string")?, flag(&args, "replace_all")).await?;
-            Ok(ToolOutput { content: msg, is_error: false, diff: Some(diff) })
+            Ok(ToolOutput { content: msg, is_error: false, diff: Some(diff), undo: before.ok().map(|before| Undo { path, before }) })
         }
         "run_command" => {
             let timeout = opt_u(&args, "timeout_seconds").map(|t| t as u64).unwrap_or(env.settings.command_timeout);
             let sh = crate::shell::detect(&env.settings.shell);
-            Ok(text(target()?.run_command(&sh, s(&args, "command")?, timeout, env.cancel).await?))
+            let opts = crate::workspace::RunOpts { live: env.live, sudo: env.sudo };
+            Ok(text(target()?.run_command(&sh, s(&args, "command")?, timeout, env.cancel, opts).await?))
         }
         "search_project_files" => {
             let p = env.project.as_ref().ok_or("Aucun projet associé à cette conversation")?;
@@ -371,7 +397,7 @@ async fn run_inner(ctx: &ToolContext, env: RunEnv<'_>, name: &str, arguments: &s
         }
         n if n.starts_with("mcp_") => {
             let (content, is_error) = env.mcp.call(n, args).await?;
-            Ok(ToolOutput { content, is_error, diff: None })
+            Ok(ToolOutput { content, is_error, ..Default::default() })
         }
         other => Err(format!("Outil inconnu : {other}")),
     }

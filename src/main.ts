@@ -26,7 +26,7 @@ import {
   type ToolContext,
   type UpdateInfo,
 } from "./api";
-import { COMPACT_PROMPT, INIT_AGENTS_PROMPT, looksUnfinished, needsApproval, systemPrompt, toApiMessages, toolCardHtml, toolLabel } from "./agent";
+import { COMPACT_PROMPT, INIT_AGENTS_PROMPT, diffHtml, looksUnfinished, needsApproval, systemPrompt, toApiMessages, toolCardHtml, toolLabel, usesSudo } from "./agent";
 import { aggregate, contextTokens, conversationUsage, fmtDuration, fmtSpeed, fmtTokens, today } from "./usage";
 import { escapeHtml, renderMarkdown } from "./markdown";
 import { initSshUi, loadHosts, openSshDialog, parseRemote, workspaceLabel } from "./ssh-ui";
@@ -73,6 +73,8 @@ const el = {
   usageInfo: $("#usage-info"),
   updateBanner: $("#update-banner"),
   gitBtn: $<HTMLButtonElement>("#git-btn"),
+  changesBtn: $<HTMLButtonElement>("#changes-btn"),
+  changesPanel: $("#changes-panel"),
   wsPicker: $<HTMLButtonElement>("#ws-picker"),
   wsMenu: $("#ws-menu"),
   instrChip: $<HTMLButtonElement>("#instr-chip"),
@@ -108,12 +110,20 @@ interface Run {
   msgId: string;
   stopped: boolean;
   activity: Activity;
-  /** Appels d'outils en attente d'une décision de l'utilisateur. */
-  approvals: Map<string, (d: "allow" | "always" | "deny") => void>;
+  /** Appels d'outils en attente d'une décision de l'utilisateur (et mot de passe sudo saisi). */
+  approvals: Map<string, (d: Decision, sudo?: SudoInput) => void>;
+}
+
+type Decision = "allow" | "always" | "deny";
+interface SudoInput {
+  password: string;
+  keep: boolean;
 }
 
 /** Bilan du dernier tour de l'agent, affiché tant que rien d'autre ne se passe. */
 interface RunOutcome {
+  /** Mode plan : le plan proposé peut être exécuté d'un clic. */
+  plan?: boolean;
   kind: "done" | "stopped" | "error" | "limit" | "denied" | "truncated";
   text: string;
   canContinue: boolean;
@@ -178,6 +188,10 @@ const uid = () => crypto.randomUUID();
 const currentRun = () => (state.current ? state.runs.get(state.current.id) : undefined);
 /** La conversation est-elle celle affichée ? (une exécution continue en arrière-plan sinon) */
 const viewing = (conv: Conversation) => state.current === conv;
+/** Mots de passe sudo retenus pour la session (en mémoire uniquement), par machine cible. */
+const sudoCache = new Map<string, string>();
+/** Machine sur laquelle s'exécutent les commandes d'une conversation : serveur SSH ou cet ordinateur. */
+const sudoTarget = (conv: Conversation) => parseRemote(conv.workspace)?.hostId ?? "local";
 /** Conversations supprimées pendant leur exécution : plus aucune sauvegarde. */
 const deletedConvs = new Set<string>();
 
@@ -707,6 +721,7 @@ function renderChrome() {
     el.convProject.value = o.projectId && findProject(o.projectId) ? o.projectId : "";
     el.convProject.classList.toggle("on", !!el.convProject.value);
   }
+  renderChanges();
   if (o.kind !== "code" || !o.workspace) toggleGitPanel(false);
   if (o.kind === "code") scheduleGitRefresh(200);
   else el.gitBtn.hidden = true;
@@ -1052,6 +1067,7 @@ function messageHtml(m: Message, next: Message | undefined): string {
     ? `<div class="msg-error">${escapeHtml(m.error)} <button class="btn-ghost sm" data-act="retry">Réessayer</button></div>`
     : "";
   const endOfTurn = !next || next.role === "user";
+  const undoCount = !next && state.current ? undoable(state.current).length : 0;
   // Comparaison avec un autre modèle : dernière réponse d'un tour simple (sans appel d'outil).
   const msgs = state.current?.messages ?? [];
   const canCompare = !next && !m.toolCalls?.length && !m.alt && !!m.content && msgs[msgs.indexOf(m) - 1]?.role === "user" && state.models.length > 1;
@@ -1062,6 +1078,7 @@ function messageHtml(m: Message, next: Message | undefined): string {
         <button class="icon-btn sm" data-act="copy" title="Copier">${icons.copy}</button>
         ${!next ? `<button class="icon-btn sm" data-act="retry" title="Régénérer">${icons.retry}</button>` : ""}
         ${canCompare ? `<button class="icon-btn sm" data-act="compare" title="Comparer avec un autre modèle">${icons.compare}</button>` : ""}
+        ${undoCount ? `<button class="btn-ghost sm" data-undo-turn title="Remet les fichiers dans l'état d'avant ce tour de l'agent">↶ Annuler ${undoCount > 1 ? `les ${undoCount} modifications` : "la modification"}</button>` : ""}
         <span class="meta">${escapeHtml(meta)}</span>
       </div>`;
   if (m.alt) {
@@ -1195,9 +1212,21 @@ el.messages.addEventListener("click", async (ev) => {
   if (approve) {
     const id = approve.closest<HTMLElement>("[data-tc]")?.dataset.tc;
     const resolve = id && currentRun()?.approvals.get(id);
-    if (resolve) resolve(approve.dataset.approve as "allow" | "always" | "deny");
+    const card = approve.closest<HTMLElement>("[data-tc]");
+    const pw = card?.querySelector<HTMLInputElement>(".sudo-pw");
+    if (resolve) {
+      resolve(approve.dataset.approve as Decision, pw ? { password: pw.value, keep: !!card?.querySelector<HTMLInputElement>(".sudo-keep")?.checked } : undefined);
+    }
     return;
   }
+  if (t.closest("[data-forget-sudo]") && state.current) {
+    // Mot de passe oublié : la carte redemande la saisie.
+    sudoCache.delete(sudoTarget(state.current));
+    for (const m of state.current.messages) for (const tc of m.toolCalls ?? []) if (tc.status === "pending" && tc.sudo) tc.sudo = "ask";
+    return renderConversation();
+  }
+  if (t.closest("[data-undo-turn]")) return undoTurn(t.closest<HTMLElement>("[data-undo-turn]")!);
+  if (t.closest("[data-run-plan]")) return runPlan();
 
   const codeBtn = t.closest<HTMLElement>(".copy-code");
   if (codeBtn) {
@@ -1234,6 +1263,14 @@ el.messages.addEventListener("click", async (ev) => {
       delete msg.alt;
       rerenderMessage(msg, true);
       return saveCurrent();
+  }
+});
+
+el.messages.addEventListener("keydown", (e) => {
+  const t = e.target as HTMLElement;
+  if (e.key === "Enter" && t.classList.contains("sudo-pw")) {
+    e.preventDefault();
+    t.closest("[data-tc]")?.querySelector<HTMLElement>('[data-approve="allow"]')?.click();
   }
 });
 
@@ -1417,6 +1454,7 @@ async function send() {
       ...(o.projectId ? { projectId: o.projectId } : {}),
     };
   }
+  for (const m of state.current.messages) for (const tc of m.toolCalls ?? []) delete tc.undo;
   state.current.messages.push({
     id: uid(),
     role: "user",
@@ -1470,7 +1508,9 @@ function renderActivity() {
     const icon = done.kind === "done" ? "✓" : done.kind === "stopped" ? "■" : "⚠";
     el.activity.className = `activity ${done.kind}`;
     el.activity.innerHTML = `<span class="act-icon">${icon}</span><span>${escapeHtml(done.text)}</span>${
-      done.canContinue ? '<button type="button" class="btn-primary sm" data-continue>Continuer</button>' : ""
+      done.plan
+        ? '<button type="button" class="btn-primary sm" data-run-plan title="Quitte le mode plan (chaque action reste soumise à votre accord) et lance l\'exécution">Exécuter le plan</button>'
+        : done.canContinue ? '<button type="button" class="btn-primary sm" data-continue>Continuer</button>' : ""
     }`;
     el.activity.hidden = false;
   } else {
@@ -1496,6 +1536,7 @@ function endRun(run: Run) {
 }
 
 el.activity.addEventListener("click", (e) => {
+  if ((e.target as HTMLElement).closest("[data-run-plan]")) return runPlan();
   if (!(e.target as HTMLElement).closest("[data-continue]") || currentRun()) return;
   el.input.value = "Continue.";
   send();
@@ -1673,12 +1714,12 @@ async function streamTurn(run: Run, msg: Message, tools: Awaited<ReturnType<type
   return ok && !run.stopped;
 }
 
-function waitApproval(run: Run, tc: ToolCallRec): Promise<"allow" | "always" | "deny"> {
+function waitApproval(run: Run, tc: ToolCallRec): Promise<{ decision: Decision; sudo?: SudoInput }> {
   return new Promise((resolve) => {
-    run.approvals.set(tc.id, (d) => {
+    run.approvals.set(tc.id, (decision, sudo) => {
       run.approvals.delete(tc.id);
       renderSidebar();
-      resolve(d);
+      resolve({ decision, sudo });
     });
     renderSidebar();
   });
@@ -1710,7 +1751,11 @@ async function runToolCalls(run: Run, msg: Message): Promise<"ok" | "denied" | "
     if (ctx.system && (risk === "read" || risk === "write")) {
       tc.outside = (await api.toolOutside(ctx, tc.name, tc.arguments).catch(() => null)) ?? undefined;
     }
-    if (needsApproval(risk, tc.name, conv.permissionMode ?? "ask", state.settings, !!tc.outside)) {
+    // sudo : approbation systématique (même en mode Autonome), avec le mot de passe.
+    const sudo = usesSudo(tc) && (platformFor(conv).remote || state.platform.os !== "windows");
+    let sudoPassword = sudo ? sudoCache.get(sudoTarget(conv)) : undefined;
+    if (sudo || needsApproval(risk, tc.name, conv.permissionMode ?? "ask", state.settings, !!tc.outside)) {
+      if (sudo) tc.sudo = sudoPassword === undefined ? "ask" : "cached";
       if (risk === "write") {
         try {
           tc.diff = (await api.previewTool(ctx, tc.name, tc.arguments)) ?? undefined;
@@ -1727,7 +1772,11 @@ async function runToolCalls(run: Run, msg: Message): Promise<"ok" | "denied" | "
       if (viewing(conv)) scrollBottom();
       setActivity(run, "En attente de votre approbation", toolLabel(tc));
       notifyAttention(conv);
-      const decision = await waitApproval(run, tc);
+      const { decision, sudo: typed } = await waitApproval(run, tc);
+      // Le mot de passe a pu être oublié pendant l'attente (bouton « Oublier »).
+      if (sudo) sudoPassword = typed?.password ?? sudoCache.get(sudoTarget(conv));
+      if (typed?.keep && typed.password) sudoCache.set(sudoTarget(conv), typed.password);
+      delete tc.sudo;
       if (decision === "deny") {
         tc.status = "denied";
         tc.result = "L'utilisateur a refusé cette action. Arrête-toi et demande-lui comment procéder.";
@@ -1751,19 +1800,29 @@ async function runToolCalls(run: Run, msg: Message): Promise<"ok" | "denied" | "
     const requestId = uid();
     Object.assign(run, { requestId, msgId: msg.id });
     try {
-      const out = await api.runTool(requestId, ctx, tc.name, tc.arguments);
+      const out = await api.runTool(requestId, ctx, tc.name, tc.arguments, {
+        sudoPassword,
+        // Sortie de la commande au fil de l'eau (seule la fin est gardée pour l'affichage).
+        onOutput: (text) => {
+          tc.live = ((tc.live ?? "") + text).slice(-8000);
+          rerenderMessage(msg);
+        },
+      });
       tc.result = out.content;
       tc.status = out.isError ? "error" : "done";
       if (out.diff) tc.diff = out.diff;
+      if (out.undo) tc.undo = out.undo;
     } catch (e) {
       tc.result = `Erreur : ${errMsg(e)}`;
       tc.status = "error";
     }
+    delete tc.live;
     rerenderMessage(msg, true);
   }
   await save(conv);
   if (viewing(conv)) {
     renderUsage();
+    renderChanges();
     if (conv.kind === "code") scheduleGitRefresh();
   }
   return run.stopped ? "stopped" : "ok";
@@ -1810,6 +1869,8 @@ async function runAgent() {
   } catch (e) {
     toast(`Outils indisponibles : ${errMsg(e)}`, true);
   }
+  // Mode plan : outils en lecture seule uniquement.
+  if (conv.kind === "code" && conv.permissionMode === "plan") tools = tools.filter((t) => t.risk === "read");
   if (tools.length && modelInfo(conv.model)?.tools === false) {
     // Ollama refuse la requête entière si le modèle ne gère pas les outils.
     tools = [];
@@ -1879,6 +1940,7 @@ async function runAgent() {
   } finally {
     const elapsed = fmtDuration(Date.now() - runStart);
     if (outcome.kind === "done") {
+      outcome.plan = conv.kind === "code" && conv.permissionMode === "plan";
       const u = conversationUsage(conv);
       outcome.text = `Terminé en ${elapsed} · ${steps} étape${steps > 1 ? "s" : ""} · ${fmtTokens(u.promptTokens + u.completionTokens)} tokens dans la conversation`;
     } else {
@@ -1902,6 +1964,131 @@ async function runAgent() {
     renderSidebar();
     await save(conv);
   }
+}
+
+// ---------------------------------------------------------------- fichiers modifiés par l'agent
+
+interface ChangedFile {
+  path: string;
+  diffs: { diff: string; undone: boolean }[];
+  added: number;
+  removed: number;
+}
+
+/** Fichiers écrits par l'agent dans la conversation, avec leurs diffs successifs. */
+function changedFiles(conv: Conversation | null): ChangedFile[] {
+  const files = new Map<string, ChangedFile>();
+  for (const m of conv?.messages ?? []) {
+    for (const tc of m.toolCalls ?? []) {
+      if (!tc.diff || tc.status !== "done" || (tc.name !== "write_file" && tc.name !== "edit_file")) continue;
+      let path = "";
+      try {
+        path = String(JSON.parse(tc.arguments).path ?? "");
+      } catch {
+        continue;
+      }
+      const f = files.get(path) ?? { path, diffs: [], added: 0, removed: 0 };
+      f.diffs.push({ diff: tc.diff, undone: !!tc.undone });
+      if (!tc.undone) {
+        for (const line of tc.diff.split("\n")) {
+          if (line.startsWith("+") && !line.startsWith("+++")) f.added++;
+          else if (line.startsWith("-") && !line.startsWith("---")) f.removed++;
+        }
+      }
+      files.set(path, f);
+    }
+  }
+  return [...files.values()];
+}
+
+let changesOpenPath = "";
+
+function renderChanges() {
+  const files = state.current?.kind === "code" ? changedFiles(state.current) : [];
+  el.changesBtn.hidden = files.length === 0;
+  el.changesBtn.querySelector("span")!.textContent = String(files.length);
+  if (!files.length) el.changesPanel.hidden = true;
+  if (el.changesPanel.hidden) return;
+  $("#changes-list").innerHTML = files
+    .map(
+      (f) => `<div class="git-file${f.path === changesOpenPath ? " open" : ""}" data-path="${escapeHtml(f.path)}">
+        <span class="git-name">${escapeHtml(f.path)}${f.diffs.every((d) => d.undone) ? " <small>annulé</small>" : f.diffs.length > 1 ? ` <small>${f.diffs.length} modifications</small>` : ""}</span>
+        <span class="chg-stat"><b class="add">+${f.added}</b> <b class="del">−${f.removed}</b></span>
+      </div>`,
+    )
+    .join("");
+  const open = files.find((f) => f.path === changesOpenPath) ?? files[0];
+  changesOpenPath = open.path;
+  $("#changes-diff").innerHTML = `<div class="git-diff-head"><code>${escapeHtml(open.path)}</code></div>${open.diffs
+    .map((d, i) => `${open.diffs.length > 1 ? `<div class="tool-label chg-step">Modification ${i + 1}${d.undone ? " (annulée)" : ""}</div>` : ""}${diffHtml(d.diff)}`)
+    .join("")}`;
+}
+
+el.changesBtn.addEventListener("click", () => {
+  el.changesPanel.hidden = !el.changesPanel.hidden;
+  if (!el.changesPanel.hidden) toggleGitPanel(false);
+  renderChanges();
+});
+$("#changes-close").addEventListener("click", () => (el.changesPanel.hidden = true));
+$("#changes-list").addEventListener("click", (e) => {
+  const path = (e.target as HTMLElement).closest<HTMLElement>("[data-path]")?.dataset.path;
+  if (path === undefined) return;
+  changesOpenPath = path;
+  renderChanges();
+});
+
+/** Sort du mode plan et demande à l'agent d'exécuter le plan qu'il vient de proposer. */
+function runPlan() {
+  const conv = state.current;
+  if (!conv || currentRun()) return;
+  conv.permissionMode = "ask";
+  renderChrome();
+  el.input.value = "Exécute ce plan.";
+  send();
+}
+
+/** Appels du dernier tour dont la modification de fichier peut encore être annulée. */
+function undoable(conv: Conversation): ToolCallRec[] {
+  const out: ToolCallRec[] = [];
+  for (let i = conv.messages.length - 1; i >= 0 && conv.messages[i].role === "assistant"; i--) {
+    for (const tc of [...(conv.messages[i].toolCalls ?? [])].reverse()) if (tc.undo && !tc.undone) out.push(tc);
+  }
+  return out; // du plus récent au plus ancien : ordre d'annulation
+}
+
+/** Annule les modifications de fichiers du dernier tour de l'agent (deux clics pour confirmer). */
+async function undoTurn(btn: HTMLElement) {
+  const conv = state.current;
+  if (!conv || currentRun()) return;
+  if (!btn.classList.contains("confirm")) {
+    btn.classList.add("confirm");
+    btn.dataset.label = btn.textContent ?? "";
+    btn.textContent = "Confirmer l'annulation";
+    setTimeout(() => {
+      if (!btn.isConnected) return;
+      btn.classList.remove("confirm");
+      btn.textContent = btn.dataset.label ?? "";
+    }, 3000);
+    return;
+  }
+  const ctx = toolCtx(conv);
+  let done = 0;
+  try {
+    for (const tc of undoable(conv)) {
+      await api.restoreFile(ctx, tc.undo!.path, tc.undo!.before);
+      tc.undone = true;
+      delete tc.undo;
+      // Le modèle voit, au tour suivant, que sa modification n'est plus en place.
+      tc.result = `${tc.result ?? ""}\n[Modification annulée ensuite par l'utilisateur : le fichier est revenu à son état précédent.]`;
+      done++;
+    }
+    toast(`${done} modification${done > 1 ? "s" : ""} annulée${done > 1 ? "s" : ""}`);
+  } catch (e) {
+    toast(`Annulation interrompue : ${errMsg(e)}`, true);
+  }
+  await saveCurrent();
+  renderConversation();
+  scheduleGitRefresh();
 }
 
 async function stopRun(run: Run) {
