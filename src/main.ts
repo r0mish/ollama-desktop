@@ -4,6 +4,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   api,
   type ApiMessage,
+  type ConvParams,
   type Conversation,
   type ConversationSummary,
   type InstructionFile,
@@ -30,6 +31,10 @@ import { initGitUi, scheduleGitRefresh, toggleGitPanel } from "./git-ui";
 import { findProject, initProjectsUi, loadProjects, openProjectDialog, projectChars, projectList } from "./projects-ui";
 import { cancelDictation, initDictation, toggleDictation } from "./dictation";
 import { initModelsUi, openModelsDialog } from "./models-ui";
+import { initPopover } from "./popover";
+import { initModelPicker, renderModelButton } from "./model-picker";
+import { initConvSettings, isCustomized } from "./conv-settings";
+import { initPalette, matches, openPalette, type PaletteItem } from "./palette";
 import type { Platform } from "./agent";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -42,7 +47,8 @@ const el = {
   title: $("#conv-title"),
   wsChip: $<HTMLButtonElement>("#ws-chip"),
   permSelect: $<HTMLSelectElement>("#perm-select"),
-  modelSelect: $<HTMLSelectElement>("#model-select"),
+  modelBtn: $<HTMLButtonElement>("#model-btn"),
+  convSettingsBtn: $<HTMLButtonElement>("#conv-settings-btn"),
   exportBtn: $<HTMLButtonElement>("#export-btn"),
   messages: $("#messages"),
   composer: $<HTMLFormElement>("#composer"),
@@ -90,9 +96,19 @@ interface Activity {
   maxSteps: number;
 }
 
+/** Exécution en cours d'une conversation. */
+interface Run {
+  conv: Conversation;
+  requestId: string;
+  msgId: string;
+  stopped: boolean;
+  activity: Activity;
+  /** Appels d'outils en attente d'une décision de l'utilisateur. */
+  approvals: Map<string, (d: "allow" | "always" | "deny") => void>;
+}
+
 /** Bilan du dernier tour de l'agent, affiché tant que rien d'autre ne se passe. */
 interface RunOutcome {
-  convId: string;
   kind: "done" | "stopped" | "error" | "limit" | "denied" | "truncated";
   text: string;
   canContinue: boolean;
@@ -106,6 +122,9 @@ interface Draft {
   permissionMode: PermissionMode;
   systemAccess?: boolean;
   projectId?: string;
+  /** Consignes et réglages choisis avant le premier envoi (absent = réglages globaux). */
+  systemPrompt?: string | null;
+  params?: ConvParams;
 }
 
 const state = {
@@ -125,14 +144,15 @@ const state = {
   mode: "chat" as Kind,
   current: null as Conversation | null,
   draft: { webSearch: false, mcp: true, permissionMode: "ask" } as Draft,
-  /** Exécution en cours (génération ou outil). */
-  busy: null as { requestId: string; msgId: string; stopped: boolean } | null,
+  /** Exécutions en cours (génération ou outil), par conversation : plusieurs peuvent tourner à la fois. */
+  runs: new Map<string, Run>(),
+  /** Conversations dont l'exécution s'est terminée en arrière-plan (pastille dans la barre latérale). */
+  unread: new Set<string>(),
   pending: { images: [] as string[], files: [] as TextFile[] },
   selectedModel: "",
   risks: new Map<string, Risk>(),
-  approvals: new Map<string, (d: "allow" | "always" | "deny") => void>(),
-  activity: null as Activity | null,
-  lastRun: null as RunOutcome | null,
+  /** Bilan de la dernière exécution, par conversation. */
+  lastRuns: new Map<string, RunOutcome>(),
   update: null as UpdateInfo | null,
   /** Projet affiché dans la barre latérale ("" = toutes les conversations). */
   projectFilter: "",
@@ -145,6 +165,13 @@ const state = {
 };
 
 const uid = () => crypto.randomUUID();
+
+/** Exécution en cours de la conversation affichée. */
+const currentRun = () => (state.current ? state.runs.get(state.current.id) : undefined);
+/** La conversation est-elle celle affichée ? (une exécution continue en arrière-plan sinon) */
+const viewing = (conv: Conversation) => state.current === conv;
+/** Conversations supprimées pendant leur exécution : plus aucune sauvegarde. */
+const deletedConvs = new Set<string>();
 
 /** Plateforme vue par l'agent : la machine locale, ou le serveur SSH du dossier de projet. */
 function platformFor(conv: Conversation): Platform {
@@ -252,7 +279,7 @@ async function loadModels() {
     }
   }
   if (!state.current && (!state.selectedModel || !modelInfo(state.selectedModel))) state.selectedModel = defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
+  renderModelButton();
   if (!state.current) renderWelcome();
   renderChrome();
 }
@@ -285,23 +312,22 @@ function defaultModelFor(kind: Kind): string {
 function pickModel(model: string) {
   state.selectedModel = model;
   state.lastModel[opts().kind] = model;
-  fillModelSelect(el.modelSelect, model);
-  renderUsage();
+  renderChrome();
 }
 
-/** Fenêtre de contexte effective : réglage num_ctx, limité au maximum du modèle. */
-function contextFor(model: string): number | null {
+/** Fenêtre de contexte effective : réglage de la conversation ou global, limité au maximum du modèle. */
+function contextFor(model: string, conv?: { params?: ConvParams } | null): number | null {
   const max = modelInfo(model)?.maxContextLength ?? null;
-  const n = state.settings.numCtx;
+  const n = conv?.params?.numCtx ?? state.settings.numCtx;
   if (!n) return null;
   return max ? Math.min(n, max) : n;
 }
 
 /** Options Ollama d'une requête : contexte et raisonnement (seulement si le modèle le gère). */
-function chatOptions(model: string, think?: boolean) {
+function chatOptions(conv: { model: string; params?: ConvParams }, think?: boolean) {
   return {
-    numCtx: contextFor(model),
-    think: modelInfo(model)?.thinking ? (think ?? state.settings.thinking) : null,
+    numCtx: contextFor(conv.model, conv),
+    think: modelInfo(conv.model)?.thinking ? (think ?? conv.params?.think ?? state.settings.thinking) : null,
   };
 }
 
@@ -320,7 +346,13 @@ function dayBucket(ts: number): string {
 }
 
 function renderSidebar() {
-  document.querySelectorAll<HTMLElement>(".mode-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.mode === state.mode));
+  document.querySelectorAll<HTMLElement>(".mode-tabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mode === state.mode);
+    // Pastille sur l'onglet : exécutions en cours, en attente d'approbation ou terminées dans ce mode.
+    const runs = [...state.runs.values()].filter((r) => r.conv.kind === b.dataset.mode);
+    const unread = state.convs.some((c) => c.kind === b.dataset.mode && state.unread.has(c.id));
+    b.dataset.status = runs.some((r) => r.approvals.size) ? "waiting" : runs.length ? "running" : unread ? "unread" : "";
+  });
   el.newChatLabel.textContent = state.mode === "code" ? "Nouvelle session de code" : "Nouvelle conversation";
   renderProjectBar();
   const q = el.search.value.trim().toLowerCase();
@@ -337,7 +369,10 @@ function renderSidebar() {
       html += `<div class="group">${escapeHtml(b)}</div>`;
       bucket = b;
     }
-    const active = (c.id === state.current?.id ? " active" : "") + (state.busy && c.id === state.current?.id ? " running" : "");
+    const run = state.runs.get(c.id);
+    const active =
+      (c.id === state.current?.id ? " active" : "") +
+      (run ? (run.approvals.size ? " waiting" : " running") : state.unread.has(c.id) ? " unread" : "");
     const subParts = [
       c.workspace ? workspaceLabel(c.workspace).name : "",
       !pf && c.projectId ? (findProject(c.projectId)?.name ?? "") : "",
@@ -379,7 +414,7 @@ el.projectSelect.addEventListener("change", () => {
     return newProject();
   }
   state.projectFilter = v;
-  if (state.current && !state.busy && (state.current.projectId ?? "") !== v) return newChat();
+  if (state.current && (state.current.projectId ?? "") !== v) return newChat();
   if (!state.current) {
     state.draft.projectId = v || undefined;
     if (state.mode === "code") state.draft.workspace = projectWorkspace(v) ?? state.draft.workspace;
@@ -477,7 +512,11 @@ el.convList.addEventListener("click", async (ev) => {
       setTimeout(() => btn.classList.remove("confirm"), 3000);
       return;
     }
-    if (state.busy && state.current?.id === id) await stop();
+    deletedConvs.add(id);
+    const run = state.runs.get(id);
+    if (run) await stopRun(run);
+    state.unread.delete(id);
+    state.lastRuns.delete(id);
     await api.deleteConversation(id);
     if (state.current?.id === id) newChat();
     await refreshConvs();
@@ -517,20 +556,17 @@ el.convList.addEventListener("click", async (ev) => {
 });
 
 async function openConversation(id: string) {
-  if (state.busy) {
-    toast("Arrêtez la génération en cours avant de changer de conversation.", true);
-    return;
-  }
   try {
-    state.current = await api.loadConversation(id);
+    // Conversation en cours d'exécution : on reprend l'objet vivant, pas la copie du disque.
+    state.current = state.runs.get(id)?.conv ?? (await api.loadConversation(id));
   } catch (e) {
     toast(errMsg(e), true);
     return;
   }
+  state.unread.delete(id);
   state.current.kind ??= "chat";
   state.mode = state.current.kind;
   state.selectedModel = state.current.model || defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
   if (state.current.workspace) api.touchWorkspace(state.current.workspace).catch(() => {});
   renderSidebar();
   renderConversation();
@@ -544,10 +580,6 @@ const projectWorkspace = (id?: string | null) => {
 };
 
 function newChat() {
-  if (state.busy) {
-    toast("Arrêtez la génération en cours d'abord.", true);
-    return;
-  }
   state.current = null;
   state.draft = {
     // Pas de dossier repris en silence : on le choisit explicitement (sauf projet avec dossier).
@@ -558,7 +590,6 @@ function newChat() {
     projectId: state.projectFilter || undefined,
   };
   state.selectedModel = defaultModelFor(state.mode);
-  fillModelSelect(el.modelSelect, state.selectedModel);
   renderSidebar();
   renderConversation();
   el.input.focus();
@@ -577,6 +608,8 @@ const opts = () => {
     systemAccess: !!(c ? c.systemAccess : state.draft.systemAccess),
     permissionMode: (c ? c.permissionMode : state.draft.permissionMode) ?? "ask",
     projectId: c ? c.projectId : state.draft.projectId,
+    systemPrompt: c ? c.systemPrompt : state.draft.systemPrompt,
+    params: c ? c.params : state.draft.params,
   };
 };
 
@@ -617,6 +650,8 @@ function renderChrome() {
   if (o.kind !== "code" || !o.workspace) toggleGitPanel(false);
   if (o.kind === "code") scheduleGitRefresh(200);
   else el.gitBtn.hidden = true;
+  renderModelButton();
+  el.convSettingsBtn.classList.toggle("on", isCustomized(o.systemPrompt, o.params, state.settings));
   el.permSelect.hidden = o.kind !== "code";
   el.permSelect.value = o.permissionMode;
   el.webToggle.classList.toggle("on", o.webSearch);
@@ -787,13 +822,31 @@ async function chooseWorkspace() {
 
 // ---------------------------------------------------------------- messages
 
+/** Modèles proposés pour un premier téléchargement. */
+const STARTER_MODELS = [
+  { id: "ministral-3:8b", title: "Polyvalent", desc: "Mistral AI · chat, images, outils · ≈ 6 Go" },
+  { id: "qwen3:8b", title: "Raisonnement", desc: "Alibaba · réfléchit avant de répondre · ≈ 5 Go" },
+  { id: "devstral-small-2", title: "Agent de code", desc: "Mistral AI · pour l'onglet Code · ≈ 15 Go" },
+];
+
+/** Étapes de l'accueil guidé : serveur, premier modèle, prise en main. */
+function onboardingHtml(step: 1 | 2 | 3, body: string): string {
+  const steps = ["Serveur Ollama", "Premier modèle", "C'est parti"];
+  const head = steps
+    .map((label, i) => `<li class="${i + 1 < step ? "done" : i + 1 === step ? "current" : ""}"><span>${i + 1 < step ? "✓" : i + 1}</span>${label}</li>`)
+    .join("");
+  return `<div class="welcome setup"><ol class="stepper">${head}</ol>${body}</div>`;
+}
+
 function renderWelcome() {
   if (!state.server) {
     el.messages.innerHTML = `<div class="welcome"><p class="muted">Connexion à Ollama…</p></div>`;
     return;
   }
   if (!connected()) {
-    el.messages.innerHTML = `<div class="welcome setup"><h2>Ollama est injoignable</h2>
+    el.messages.innerHTML = onboardingHtml(
+      1,
+      `<h2>Ollama est injoignable</h2>
       <p class="muted">${escapeHtml(state.server.error ?? "")}</p>
       <ol class="setup-steps">
         <li>Installez Ollama : <a href="https://ollama.com/download" data-external>ollama.com/download</a> (Linux : <code>curl -fsSL https://ollama.com/install.sh | sh</code>, ou le paquet de votre distribution)</li>
@@ -801,15 +854,34 @@ function renderWelcome() {
         <li>Serveur sur une autre machine ? Indiquez son adresse dans les réglages.</li>
       </ol>
       <p class="row center"><button class="btn-primary" data-retry-server>Réessayer</button><button class="btn-ghost" data-open-settings>Adresse du serveur…</button></p>
-    </div>`;
+      <p class="muted small">La connexion est retentée automatiquement toutes les 15 secondes.</p>`,
+    );
     return;
   }
   if (state.modelsLoaded && !state.models.length) {
-    el.messages.innerHTML = `<div class="welcome"><h2>Aucun modèle installé</h2>
-      <p>Connecté à Ollama ${escapeHtml(state.server.version ?? "")}. Téléchargez un premier modèle pour commencer.</p>
-      <p><button class="btn-primary" data-open-models>Choisir un modèle</button></p>
-      <p class="muted small">Pour démarrer : <code>ministral-3:8b</code> (Mistral AI, ≈ 6 Go) ou <code>qwen3:8b</code> ; pour l'agent de code, un modèle gérant les outils comme <code>devstral-small-2</code> ou <code>qwen3-coder:30b</code>.</p>
-    </div>`;
+    el.messages.innerHTML = onboardingHtml(
+      2,
+      `<h2>Choisissez un premier modèle</h2>
+      <p>Connecté à Ollama ${escapeHtml(state.server.version ?? "")}. Le modèle est téléchargé une fois, puis tourne entièrement sur votre machine.</p>
+      <div class="starter-models">${STARTER_MODELS.map(
+        (m) => `<button class="starter" data-pull-model="${m.id}"><strong>${m.title}</strong><code>${m.id}</code><small>${m.desc}</small></button>`,
+      ).join("")}</div>
+      <p><button class="btn-ghost" data-open-models>Voir tous les modèles…</button></p>`,
+    );
+    return;
+  }
+  if (!state.settings.onboarded) {
+    el.messages.innerHTML = onboardingHtml(
+      3,
+      `<h2>Tout est prêt</h2>
+      <p>${state.models.length} modèle${state.models.length > 1 ? "s" : ""} disponible${state.models.length > 1 ? "s" : ""} sur votre serveur Ollama. Rien ne quitte votre machine.</p>
+      <div class="tips">
+        <div class="tip"><strong>Chat</strong><small>Posez une question, joignez une image, un PDF ou du code. Plusieurs conversations peuvent tourner en même temps.</small></div>
+        <div class="tip"><strong>Code</strong><small>Un agent lit, modifie et teste un projet local ou sur un serveur SSH, avec votre accord à chaque étape.</small></div>
+        <div class="tip"><strong>${state.platform.os === "macos" ? "⌘" : "Ctrl+"}K</strong><small>La palette de commandes : actions, conversations, modèles et projets au clavier.</small></div>
+      </div>
+      <p><button class="btn-primary" data-finish-onboarding>Commencer</button></p>`,
+    );
     return;
   }
   if (state.mode === "code") {
@@ -891,7 +963,7 @@ function messageHtml(m: Message, next: Message | undefined): string {
       </div>
     </div>`;
   }
-  const streaming = state.busy?.msgId === m.id;
+  const streaming = currentRun()?.msgId === m.id;
   const reasoning = m.reasoning
     ? `<details class="reasoning"${streaming && !m.content ? " open" : ""}><summary>Raisonnement</summary><div class="md">${renderMarkdown(m.reasoning)}</div></details>`
     : "";
@@ -907,7 +979,7 @@ function messageHtml(m: Message, next: Message | undefined): string {
     : "";
   const endOfTurn = !next || next.role === "user";
   // Pendant l'exécution, le dernier message n'a pas encore d'actions (copier, régénérer…).
-  const actions = streaming || !endOfTurn || (state.busy && !next)
+  const actions = streaming || !endOfTurn || (currentRun() && !next)
     ? ""
     : `<div class="msg-actions">
         <button class="icon-btn sm" data-act="copy" title="Copier">${icons.copy}</button>
@@ -991,6 +1063,14 @@ el.messages.addEventListener("click", async (ev) => {
   const t = ev.target as HTMLElement;
   if (t.closest("[data-open-settings]")) return openSettings();
   if (t.closest("[data-open-models]")) return openModelsDialog();
+  const starter = t.closest<HTMLElement>("[data-pull-model]");
+  if (starter) return openModelsDialog(starter.dataset.pullModel);
+  if (t.closest("[data-finish-onboarding]")) {
+    state.settings.onboarded = true;
+    api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
+    renderWelcome();
+    return el.input.focus();
+  }
   if (t.closest("[data-retry-server]")) {
     state.server = null;
     renderWelcome();
@@ -1010,7 +1090,7 @@ el.messages.addEventListener("click", async (ev) => {
   const approve = t.closest<HTMLElement>("[data-approve]");
   if (approve) {
     const id = approve.closest<HTMLElement>("[data-tc]")?.dataset.tc;
-    const resolve = id && state.approvals.get(id);
+    const resolve = id && currentRun()?.approvals.get(id);
     if (resolve) resolve(approve.dataset.approve as "allow" | "always" | "deny");
     return;
   }
@@ -1048,7 +1128,7 @@ function turnText(msg: Message): string {
 }
 
 function editMessage(msg: Message, node: HTMLElement) {
-  if (state.busy) return;
+  if (currentRun()) return;
   const bubble = node.querySelector<HTMLElement>(".bubble")!;
   const box = document.createElement("div");
   box.className = "edit-box";
@@ -1077,7 +1157,7 @@ function editMessage(msg: Message, node: HTMLElement) {
 }
 
 async function regenerate(msg: Message) {
-  if (state.busy || !state.current) return;
+  if (currentRun() || !state.current) return;
   const msgs = state.current.messages;
   let idx = msgs.indexOf(msg);
   // On repart du dernier message utilisateur précédant ce tour.
@@ -1090,19 +1170,23 @@ async function regenerate(msg: Message) {
 
 // ---------------------------------------------------------------- envoi et boucle d'agent
 
-async function saveCurrent() {
-  if (!state.current) return;
-  state.current.updatedAt = Date.now();
+async function save(conv: Conversation) {
+  if (deletedConvs.has(conv.id)) return;
+  conv.updatedAt = Date.now();
   try {
-    await api.saveConversation(state.current);
+    await api.saveConversation(conv);
     await refreshConvs();
   } catch (e) {
     toast(`Sauvegarde impossible : ${errMsg(e)}`, true);
   }
 }
 
+const saveCurrent = async () => {
+  if (state.current) await save(state.current);
+};
+
 async function send() {
-  if (state.busy) return stop();
+  if (currentRun()) return stop();
   const text = el.input.value.trim();
   const { images, files } = state.pending;
   if (!text && !images.length && !files.length) return;
@@ -1141,7 +1225,8 @@ async function send() {
       model,
       createdAt: now,
       updatedAt: now,
-      systemPrompt: state.settings.systemPrompt || null,
+      systemPrompt: o.systemPrompt ?? (state.settings.systemPrompt || null),
+      ...(o.params ? { params: o.params } : {}),
       messages: [],
       workspace: o.workspace,
       permissionMode: o.permissionMode,
@@ -1178,20 +1263,19 @@ const toolCtx = (c: Conversation): ToolContext => ({
 
 let activityTimer = 0;
 
-function setActivity(phase: string, detail?: string, extra: Partial<Activity> = {}) {
-  const a = state.activity;
-  if (!a) return;
+function setActivity(run: Run, phase: string, detail?: string, extra: Partial<Activity> = {}) {
+  const a = run.activity;
   if (a.phase !== phase || a.detail !== detail) {
     Object.assign(a, { phase, detail, since: Date.now(), until: undefined }, extra);
   } else {
     Object.assign(a, extra);
   }
-  renderActivity();
+  if (viewing(run.conv)) renderActivity();
 }
 
 function renderActivity() {
-  const a = state.activity;
-  const done = state.lastRun && state.lastRun.convId === state.current?.id ? state.lastRun : null;
+  const a = currentRun()?.activity;
+  const done = state.current ? state.lastRuns.get(state.current.id) : undefined;
   if (a) {
     const now = Date.now();
     const wait = a.until ? ` ${Math.max(0, Math.ceil((a.until - now) / 1000))} s` : "";
@@ -1213,13 +1297,28 @@ function renderActivity() {
   }
 }
 
+/** Démarre l'exécution d'une conversation (chronomètre de la barre d'activité compris). */
+function startRun(conv: Conversation, activity: Activity): Run {
+  const run: Run = { conv, requestId: "", msgId: "", stopped: false, activity, approvals: new Map() };
+  state.runs.set(conv.id, run);
+  state.lastRuns.delete(conv.id);
+  clearInterval(activityTimer);
+  activityTimer = window.setInterval(renderActivity, 1000);
+  return run;
+}
+
+function endRun(run: Run) {
+  state.runs.delete(run.conv.id);
+  for (const resolve of [...run.approvals.values()]) resolve("deny");
+  run.approvals.clear();
+  if (!state.runs.size) clearInterval(activityTimer);
+}
+
 el.activity.addEventListener("click", (e) => {
-  if (!(e.target as HTMLElement).closest("[data-continue]") || state.busy) return;
+  if (!(e.target as HTMLElement).closest("[data-continue]") || currentRun()) return;
   el.input.value = "Continue.";
   send();
 });
-
-const maxContext = (model: string) => contextFor(model);
 
 function renderUsage() {
   const c = state.current;
@@ -1228,9 +1327,9 @@ function renderUsage() {
     el.usageInfo.hidden = true;
     return;
   }
-  const model = state.busy ? c.model : state.selectedModel || c.model;
+  const model = currentRun() ? c.model : state.selectedModel || c.model;
   const ctx = contextTokens(c, () => toApiMessages(c, sysPrompt(c)));
-  const max = maxContext(model);
+  const max = contextFor(model, c);
   const pct = max ? Math.min(100, Math.round((ctx.tokens / max) * 100)) : null;
   el.ctxMeter.hidden = false;
   el.ctxMeter.classList.toggle("warn", (pct ?? 0) >= 70);
@@ -1255,20 +1354,20 @@ function renderUsage() {
 
 el.ctxMeter.addEventListener("click", async () => {
   const c = state.current;
-  if (!c || state.busy || !c.messages.length) return;
-  state.busy = { requestId: "", msgId: "", stopped: false };
-  state.activity = { phase: "", since: Date.now(), runStart: Date.now(), step: 0, maxSteps: 0 };
+  if (!c || currentRun() || !c.messages.length) return;
+  const run = startRun(c, { phase: "", since: Date.now(), runStart: Date.now(), step: 0, maxSteps: 0 });
   updateComposerState();
   try {
-    await compact(c);
+    await compact(run);
     toast("Historique compacté");
   } catch (e) {
     toast(`Compaction impossible : ${errMsg(e)}`, true);
   } finally {
-    state.busy = null;
-    state.activity = null;
-    updateComposerState();
-    renderConversation();
+    endRun(run);
+    if (viewing(c)) {
+      updateComposerState();
+      renderConversation();
+    }
     renderSidebar();
   }
 });
@@ -1284,8 +1383,9 @@ function recordUsage(conv: Conversation, model: string, promptTokens: number, co
 }
 
 /** Résume l'historique pour libérer le contexte ; les messages restent affichés. */
-async function compact(conv: Conversation) {
-  setActivity("Compaction du contexte…", "résumé de l'historique par le modèle");
+async function compact(run: Run) {
+  const conv = run.conv;
+  setActivity(run, "Compaction du contexte…", "résumé de l'historique par le modèle");
   const messages: ApiMessage[] = toApiMessages(conv, sysPrompt(conv));
   if (messages[messages.length - 1]?.role === "tool") messages.push({ role: "assistant", content: "(Pause.)" });
   messages.push({ role: "user", content: COMPACT_PROMPT });
@@ -1294,25 +1394,25 @@ async function compact(conv: Conversation) {
   // Les définitions d'outils accompagnent l'historique (qui contient des appels), mais sans appel possible.
   const tools = await api.toolDefinitions(toolCtx(conv)).catch(() => []);
   const requestId = uid();
-  if (state.busy) state.busy.requestId = requestId;
+  run.requestId = requestId;
   await api.chat(
     requestId,
-    { model: conv.model, messages, temperature: 0.2, maxTokens: 4000, tools: tools.map((t) => t.definition), toolChoice: "none", ...chatOptions(conv.model, false) },
+    { model: conv.model, messages, temperature: 0.2, maxTokens: 4000, tools: tools.map((t) => t.definition), toolChoice: "none", ...chatOptions(conv, false) },
     (ev) => {
       if (ev.type === "delta") summary += ev.text;
       else if (ev.type === "usage") recordUsage(conv, conv.model, ev.promptTokens, ev.completionTokens, true);
-      else if (ev.type === "retry") setActivity("Compaction : nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
+      else if (ev.type === "retry") setActivity(run, "Compaction : nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
       else if (ev.type === "done" && ev.cancelled) failed = "annulée";
     },
   );
   if (failed || !summary.trim()) throw new Error(failed || "résumé vide");
   conv.compaction = { summary: summary.trim(), upto: conv.messages.length, at: Date.now() };
-  await saveCurrent();
+  await save(conv);
 }
 
 const shouldCompact = (conv: Conversation) => {
   const pctLimit = state.settings.autoCompactPercent;
-  const max = maxContext(conv.model);
+  const max = contextFor(conv.model, conv);
   if (!pctLimit || !max || conv.messages.length < 4) return false;
   if (conv.compaction && conv.compaction.upto >= conv.messages.length - 1) return false;
   const ctx = contextTokens(conv, () => toApiMessages(conv, sysPrompt(conv)));
@@ -1322,11 +1422,12 @@ const shouldCompact = (conv: Conversation) => {
 // ---------------------------------------------------------------- boucle d'agent
 
 /** Un tour du modèle en streaming. Renvoie false en cas d'erreur ou d'arrêt. */
-async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<ReturnType<typeof api.toolDefinitions>>): Promise<boolean> {
+async function streamTurn(run: Run, msg: Message, tools: Awaited<ReturnType<typeof api.toolDefinitions>>): Promise<boolean> {
+  const conv = run.conv;
   const requestId = uid();
-  if (state.busy) Object.assign(state.busy, { requestId, msgId: msg.id });
+  Object.assign(run, { requestId, msgId: msg.id });
   const messages = toApiMessages({ ...conv, messages: conv.messages.filter((m) => m !== msg) }, sysPrompt(conv));
-  setActivity("En attente du modèle…", `${conv.model} · chargement et lecture de l'invite`);
+  setActivity(run, "En attente du modèle…", `${conv.model} · chargement et lecture de l'invite`);
   let ok = true;
   try {
     await api.chat(
@@ -1334,20 +1435,20 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
       {
         model: conv.model,
         messages,
-        temperature: state.settings.temperature,
+        temperature: conv.params?.temperature ?? state.settings.temperature,
         maxTokens: state.settings.maxTokens,
         tools: tools.map((t) => t.definition),
-        ...chatOptions(conv.model),
+        ...chatOptions(conv),
       },
       (ev) => {
         switch (ev.type) {
           case "delta":
             msg.content += ev.text;
-            setActivity("Rédaction…", `≈ ${fmtTokens(Math.round(msg.content.length / 3.5))} tokens`);
+            setActivity(run, "Rédaction…", `≈ ${fmtTokens(Math.round(msg.content.length / 3.5))} tokens`);
             break;
           case "reasoning":
             msg.reasoning = (msg.reasoning ?? "") + ev.text;
-            setActivity("Réflexion…", `≈ ${fmtTokens(Math.round(msg.reasoning.length / 3.5))} tokens`);
+            setActivity(run, "Réflexion…", `≈ ${fmtTokens(Math.round(msg.reasoning.length / 3.5))} tokens`);
             break;
           case "usage":
             msg.usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, tokensPerSec: ev.tokensPerSec };
@@ -1355,10 +1456,10 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
             break;
           case "toolCalls":
             msg.toolCalls = ev.calls.map((c) => ({ ...c, status: "queued" as const }));
-            setActivity("Préparation des actions…", `${ev.calls.length} appel(s) d'outil`);
+            setActivity(run, "Préparation des actions…", `${ev.calls.length} appel(s) d'outil`);
             break;
           case "retry":
-            setActivity("Nouvel essai dans", `${ev.reason} · tentative ${ev.attempt + 1}/${ev.maxAttempts}`, {
+            setActivity(run, "Nouvel essai dans", `${ev.reason} · tentative ${ev.attempt + 1}/${ev.maxAttempts}`, {
               until: Date.now() + ev.delaySecs * 1000,
             });
             break;
@@ -1374,7 +1475,7 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
             break;
         }
         rerenderMessage(msg);
-        if (ev.type === "usage") renderUsage();
+        if (ev.type === "usage" && viewing(conv)) renderUsage();
       },
     );
   } catch (e) {
@@ -1388,20 +1489,23 @@ async function streamTurn(conv: Conversation, msg: Message, tools: Awaited<Retur
       tc.result = "Non exécuté (interrompu).";
     }
   }
-  return ok && !state.busy?.stopped;
+  return ok && !run.stopped;
 }
 
-function waitApproval(tc: ToolCallRec): Promise<"allow" | "always" | "deny"> {
+function waitApproval(run: Run, tc: ToolCallRec): Promise<"allow" | "always" | "deny"> {
   return new Promise((resolve) => {
-    state.approvals.set(tc.id, (d) => {
-      state.approvals.delete(tc.id);
+    run.approvals.set(tc.id, (d) => {
+      run.approvals.delete(tc.id);
+      renderSidebar();
       resolve(d);
     });
+    renderSidebar();
   });
 }
 
 /** Exécute les appels d'outils d'un message. Renvoie "ok", "denied" ou "stopped". */
-async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "denied" | "stopped"> {
+async function runToolCalls(run: Run, msg: Message): Promise<"ok" | "denied" | "stopped"> {
+  const conv = run.conv;
   const ctx = toolCtx(conv);
   const calls = msg.toolCalls ?? [];
   for (let i = 0; i < calls.length; i++) {
@@ -1415,7 +1519,7 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
       }
       rerenderMessage(msg, true);
     };
-    if (state.busy?.stopped) {
+    if (run.stopped) {
       skipRest("Non exécuté : arrêté par l'utilisateur.");
       return "stopped";
     }
@@ -1439,15 +1543,15 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
       }
       tc.status = "pending";
       rerenderMessage(msg, true);
-      scrollBottom();
-      setActivity("En attente de votre approbation", toolLabel(tc));
-      notifyAttention();
-      const decision = await waitApproval(tc);
+      if (viewing(conv)) scrollBottom();
+      setActivity(run, "En attente de votre approbation", toolLabel(tc));
+      notifyAttention(conv);
+      const decision = await waitApproval(run, tc);
       if (decision === "deny") {
         tc.status = "denied";
         tc.result = "L'utilisateur a refusé cette action. Arrête-toi et demande-lui comment procéder.";
         skipRest("Non exécuté : une action précédente a été refusée.");
-        return state.busy?.stopped ? "stopped" : "denied";
+        return run.stopped ? "stopped" : "denied";
       }
       if (decision === "always") {
         if (risk === "mcp") {
@@ -1455,16 +1559,16 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
           api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
         } else if (risk === "write" && !tc.outside) {
           conv.permissionMode = "acceptEdits";
-          renderChrome();
+          if (viewing(conv)) renderChrome();
         }
       }
     }
 
     tc.status = "running";
     rerenderMessage(msg, true);
-    setActivity("Exécution", toolLabel(tc));
+    setActivity(run, "Exécution", toolLabel(tc));
     const requestId = uid();
-    if (state.busy) Object.assign(state.busy, { requestId, msgId: msg.id });
+    Object.assign(run, { requestId, msgId: msg.id });
     try {
       const out = await api.runTool(requestId, ctx, tc.name, tc.arguments);
       tc.result = out.content;
@@ -1476,14 +1580,17 @@ async function runToolCalls(conv: Conversation, msg: Message): Promise<"ok" | "d
     }
     rerenderMessage(msg, true);
   }
-  await saveCurrent();
-  renderUsage();
-  if (conv.kind === "code") scheduleGitRefresh();
-  return state.busy?.stopped ? "stopped" : "ok";
+  await save(conv);
+  if (viewing(conv)) {
+    renderUsage();
+    if (conv.kind === "code") scheduleGitRefresh();
+  }
+  return run.stopped ? "stopped" : "ok";
 }
 
-/** Attire l'attention si la fenêtre n'a pas le focus (approbation requise). */
-function notifyAttention() {
+/** Approbation requise : prévient si la fenêtre n'a pas le focus ou si la conversation n'est pas affichée. */
+function notifyAttention(conv: Conversation) {
+  if (!viewing(conv)) toast(`« ${conv.title} » attend votre approbation`);
   if (document.hasFocus()) return;
   document.title = "⏸ Approbation requise — Ollama Desktop";
   window.addEventListener("focus", () => (document.title = "Ollama Desktop"), { once: true });
@@ -1491,22 +1598,18 @@ function notifyAttention() {
 
 async function runAgent() {
   const conv = state.current;
-  if (!conv) return;
+  if (!conv || state.runs.has(conv.id)) return;
   conv.model = state.selectedModel;
   const maxSteps = conv.kind === "code" ? Math.max(5, state.settings.maxSteps || 100) : MAX_CHAT_STEPS;
   const runStart = Date.now();
-  state.busy = { requestId: "", msgId: "", stopped: false };
-  state.lastRun = null;
-  state.activity = { phase: "Préparation…", since: runStart, runStart, step: 1, maxSteps };
-  clearInterval(activityTimer);
-  activityTimer = window.setInterval(renderActivity, 1000);
+  const run = startRun(conv, { phase: "Préparation…", since: runStart, runStart, step: 1, maxSteps });
   updateComposerState();
   renderSidebar();
 
   if (conv.projectId && findProject(conv.projectId)?.files.length) {
     // Gros projets : seuls les extraits pertinents pour la dernière question sont joints.
     const question = [...conv.messages].reverse().find((m) => m.role === "user" && !m.auto)?.content ?? "";
-    setActivity("Recherche dans les fichiers du projet…");
+    setActivity(run, "Recherche dans les fichiers du projet…");
     try {
       state.projectCtx.set(conv.id, await api.projectContext(conv.projectId, question));
     } catch {
@@ -1515,7 +1618,7 @@ async function runAgent() {
   }
   if (conv.kind === "code" && conv.workspace) {
     // Relu à chaque tâche : l'agent ou l'utilisateur ont pu modifier AGENTS.md.
-    setActivity("Lecture des consignes du projet…", workspaceLabel(conv.workspace).name);
+    setActivity(run, "Lecture des consignes du projet…", workspaceLabel(conv.workspace).name);
     await loadInstructions(conv.workspace);
   }
 
@@ -1532,9 +1635,9 @@ async function runAgent() {
     toast(`${conv.model} ne gère pas les outils : recherche web et MCP désactivés pour cette réponse.`);
   }
 
-  renderConversation();
-  await saveCurrent();
-  let outcome: Omit<RunOutcome, "convId"> = { kind: "done", text: "", canContinue: false };
+  if (viewing(conv)) renderConversation();
+  await save(conv);
+  let outcome: RunOutcome = { kind: "done", text: "", canContinue: false };
   let steps = 0;
   let nudges = 0;
   try {
@@ -1544,28 +1647,28 @@ async function runAgent() {
         break;
       }
       steps = step;
-      if (state.activity) state.activity.step = step;
+      run.activity.step = step;
       if (shouldCompact(conv)) {
         try {
-          await compact(conv);
-          renderConversation();
+          await compact(run);
+          if (viewing(conv)) renderConversation();
         } catch (e) {
           toast(`Compaction automatique impossible : ${errMsg(e)}`, true);
         }
       }
       const msg: Message = { id: uid(), role: "assistant", content: "", model: conv.model, createdAt: Date.now() };
       conv.messages.push(msg);
-      if (state.busy) state.busy.msgId = msg.id;
+      run.msgId = msg.id;
       rerenderMessage(msg, true);
-      const ok = await streamTurn(conv, msg, tools);
+      const ok = await streamTurn(run, msg, tools);
       if (!msg.content && !msg.reasoning && !msg.toolCalls?.length && !msg.error && !msg.cancelled) {
         msg.error = "Réponse vide du modèle.";
       }
       rerenderMessage(msg, true);
-      await saveCurrent();
-      renderUsage();
+      await save(conv);
+      if (viewing(conv)) renderUsage();
       if (!ok) {
-        outcome = state.busy?.stopped || msg.cancelled
+        outcome = run.stopped || msg.cancelled
           ? { kind: "stopped", text: "Arrêté à votre demande.", canContinue: true }
           : msg.error?.startsWith("Réponse tronquée")
             ? { kind: "truncated", text: "Réponse coupée : limite de tokens atteinte (réglages « Tokens max » ou « Fenêtre de contexte »).", canContinue: true }
@@ -1577,12 +1680,12 @@ async function runAgent() {
         if (conv.kind === "code" && state.settings.autoContinue && nudges < MAX_AUTO_CONTINUE && looksUnfinished(msg.content)) {
           nudges++;
           conv.messages.push({ id: uid(), role: "user", content: AUTO_CONTINUE_TEXT, createdAt: Date.now(), auto: true });
-          renderConversation();
+          if (viewing(conv)) renderConversation();
           continue;
         }
         break;
       }
-      const res = await runToolCalls(conv, msg);
+      const res = await runToolCalls(run, msg);
       if (res === "denied") {
         outcome = { kind: "denied", text: "En pause : vous avez refusé une action. Donnez vos consignes pour continuer.", canContinue: false };
         break;
@@ -1600,33 +1703,40 @@ async function runAgent() {
     } else {
       outcome.text += ` (${elapsed}, ${steps} étape${steps > 1 ? "s" : ""})`;
     }
-    state.lastRun = { ...outcome, convId: conv.id };
-    state.busy = null;
-    state.activity = null;
-    clearInterval(activityTimer);
-    for (const resolve of state.approvals.values()) resolve("deny");
-    state.approvals.clear();
-    const last = conv.messages[conv.messages.length - 1];
-    if (last) rerenderMessage(last, true);
-    updateComposerState();
-    renderActivity();
+    endRun(run);
+    if (!deletedConvs.has(conv.id)) {
+      state.lastRuns.set(conv.id, outcome);
+      if (viewing(conv)) {
+        const last = conv.messages[conv.messages.length - 1];
+        if (last) rerenderMessage(last, true);
+        updateComposerState();
+        renderActivity();
+        renderUsage();
+      } else {
+        // Terminée en arrière-plan : pastille dans la barre latérale et notification.
+        state.unread.add(conv.id);
+        toast(outcome.kind === "done" ? `« ${conv.title} » : réponse terminée` : `« ${conv.title} » : ${outcome.text}`, outcome.kind === "error");
+      }
+    }
     renderSidebar();
-    renderUsage();
-    await saveCurrent();
+    await save(conv);
   }
 }
 
+async function stopRun(run: Run) {
+  run.stopped = true;
+  for (const resolve of [...run.approvals.values()]) resolve("deny");
+  if (run.requestId) await api.cancel(run.requestId).catch(() => {});
+}
+
 async function stop() {
-  const b = state.busy;
-  if (!b) return;
-  b.stopped = true;
-  for (const resolve of [...state.approvals.values()]) resolve("deny");
-  if (b.requestId) await api.cancel(b.requestId).catch(() => {});
+  const run = currentRun();
+  if (run) await stopRun(run);
 }
 
 function updateComposerState() {
-  el.app.classList.toggle("is-streaming", !!state.busy);
-  el.sendBtn.title = state.busy ? "Arrêter (Échap)" : "Envoyer";
+  el.app.classList.toggle("is-streaming", !!currentRun());
+  el.sendBtn.title = currentRun() ? "Arrêter (Échap)" : "Envoyer";
   el.hint.textContent = state.settings?.sendOnEnter ? "Entrée pour envoyer · Maj+Entrée pour un retour ligne" : "Ctrl+Entrée pour envoyer";
 }
 
@@ -1648,7 +1758,6 @@ el.input.addEventListener("keydown", (e) => {
     send();
   }
 });
-el.modelSelect.addEventListener("change", () => pickModel(el.modelSelect.value));
 el.exportBtn.addEventListener("click", async () => {
   if (!state.current) return;
   try {
@@ -1895,8 +2004,8 @@ el.updateBanner.addEventListener("click", (e) => {
 /** Télécharge, vérifie la signature, installe puis redémarre (géré côté Rust). */
 async function installUpdate() {
   if (installing) return;
-  if (state.busy) {
-    toast("Attendez la fin de la tâche en cours avant d'installer la mise à jour.", true);
+  if (state.runs.size) {
+    toast("Attendez la fin des tâches en cours avant d'installer la mise à jour.", true);
     return;
   }
   installing = true;
@@ -2248,7 +2357,6 @@ $("#settings-form").addEventListener("submit", async (e) => {
     }
     el.settings.close();
     if (baseChanged) await loadModels();
-    else fillModelSelect(el.modelSelect, state.selectedModel);
     renderChrome();
     if (!state.current) renderWelcome();
   } catch (err) {
@@ -2285,7 +2393,7 @@ window.addEventListener("keydown", (e) => {
     el.app.classList.toggle("sidebar-hidden");
   } else if (mod && k === "k") {
     e.preventDefault();
-    el.search.focus();
+    openPalette();
   } else if (mod && k === "g" && opts().kind === "code" && opts().workspace) {
     e.preventDefault();
     toggleGitPanel();
@@ -2307,10 +2415,79 @@ window.addEventListener("keydown", (e) => {
     document.querySelector<HTMLDialogElement>("dialog[open]")!.close();
   } else if (e.key === "Escape" && cancelDictation()) {
     e.preventDefault();
-  } else if (e.key === "Escape" && state.busy) {
+  } else if (e.key === "Escape" && currentRun()) {
     stop();
   }
 });
+
+// ---------------------------------------------------------------- palette de commandes
+
+function setTheme(theme: Settings["theme"]) {
+  state.settings.theme = theme;
+  applyTheme(theme);
+  api.saveSettings(state.settings).catch((e) => toast(errMsg(e), true));
+}
+
+function paletteItems(q: string): PaletteItem[] {
+  const o = opts();
+  const actions: PaletteItem[] = [
+    { group: "Actions", label: "Nouvelle conversation", hint: "Ctrl+N", keywords: "chat discuter", run: () => { state.mode = "chat"; newChat(); } },
+    { group: "Actions", label: "Nouvelle session de code", hint: "Ctrl+2", keywords: "agent projet dossier", run: () => { state.mode = "code"; newChat(); } },
+    { group: "Actions", label: "Gérer les modèles", hint: "Ctrl+M", keywords: "télécharger installer supprimer décharger pull", run: () => openModelsDialog() },
+    { group: "Actions", label: "Réglages", hint: "Ctrl+,", keywords: "préférences configuration serveur", run: () => openSettings() },
+    { group: "Actions", label: "Serveurs SSH…", keywords: "distant remote connexion clé", run: () => openSshDialog() },
+    { group: "Actions", label: "Nouveau projet…", keywords: "consignes fichiers", run: () => newProject() },
+    { group: "Actions", label: "Afficher ou masquer la barre latérale", hint: "Ctrl+B", run: () => el.app.classList.toggle("sidebar-hidden") },
+    { group: "Actions", label: "Thème clair", keywords: "apparence light", run: () => setTheme("light") },
+    { group: "Actions", label: "Thème sombre", keywords: "apparence dark nuit", run: () => setTheme("dark") },
+    { group: "Actions", label: "Thème du système", keywords: "apparence automatique", run: () => setTheme("system") },
+  ];
+  if (state.current) {
+    actions.push(
+      { group: "Actions", label: "Réglages de cette conversation", keywords: "température contexte consignes raisonnement", run: () => el.convSettingsBtn.click() },
+      { group: "Actions", label: "Exporter la conversation en Markdown", run: () => el.exportBtn.click() },
+      { group: "Actions", label: "Compacter le contexte", keywords: "résumer historique", run: () => el.ctxMeter.click() },
+    );
+  }
+  if (o.kind === "code" && o.workspace) actions.push({ group: "Actions", label: "Panneau Git", hint: "Ctrl+G", keywords: "commit branche diff", run: () => toggleGitPanel() });
+
+  const items = actions.filter((a) => matches(q, `${a.label} ${a.keywords ?? ""}`));
+  const convs = state.convs.filter((c) => matches(q, c.title)).slice(0, q ? 8 : 6);
+  for (const c of convs) {
+    items.push({
+      group: q ? "Conversations" : "Conversations récentes",
+      label: c.title,
+      hint: [c.kind === "code" ? "Code" : "", state.runs.has(c.id) ? "en cours" : dayBucket(c.updatedAt)].filter(Boolean).join(" · "),
+      run: () => openConversation(c.id),
+    });
+  }
+  if (q) {
+    for (const m of state.models.filter((m) => matches(q, m.id)).slice(0, 6)) {
+      items.push({ group: "Modèles", label: m.id, hint: "utiliser pour cette conversation", run: () => pickModel(m.id) });
+    }
+    for (const p of projectList().filter((p) => matches(q, p.name)).slice(0, 5)) {
+      items.push({
+        group: "Projets",
+        label: p.name,
+        hint: "afficher le projet",
+        run: () => {
+          el.projectSelect.value = p.id;
+          el.projectSelect.dispatchEvent(new Event("change"));
+        },
+      });
+    }
+  }
+  return items;
+}
+
+/** Conversations dont le contenu (et pas seulement le titre) correspond à la requête. */
+async function paletteSearch(q: string): Promise<PaletteItem[]> {
+  const hits = await api.searchConversations(q.toLowerCase());
+  return hits.slice(0, 8).flatMap((h) => {
+    const c = state.convs.find((x) => x.id === h.id);
+    return c ? [{ group: "Conversations", label: c.title, hint: h.snippet ?? undefined, run: () => openConversation(c.id) }] : [];
+  });
+}
 
 // ---------------------------------------------------------------- démarrage
 
@@ -2333,6 +2510,33 @@ async function init() {
     onWorkspaceAdded: () => api.listWorkspaces().then((w) => (state.workspaces = w)).catch(() => {}),
   });
   initDictation({ input: el.input, toast });
+  initPopover();
+  initModelPicker({
+    button: el.modelBtn,
+    models: () => state.models,
+    loaded: () => state.loaded,
+    setLoaded: (names) => (state.loaded = names),
+    selected: () => state.selectedModel,
+    kind: () => opts().kind,
+    pick: pickModel,
+    manage: () => openModelsDialog(),
+  });
+  initConvSettings({
+    button: el.convSettingsBtn,
+    settings: () => state.settings,
+    get: () => {
+      const o = opts();
+      const model = state.selectedModel;
+      return { systemPrompt: o.systemPrompt, params: o.params, thinkingModel: !!modelInfo(model)?.thinking, maxContext: modelInfo(model)?.maxContextLength ?? null };
+    },
+    set: (systemPrompt, params) => {
+      if (state.current) Object.assign(state.current, { systemPrompt, params });
+      else Object.assign(state.draft, { systemPrompt: systemPrompt ?? undefined, params });
+      if (state.current) saveCurrent();
+      renderChrome();
+    },
+  });
+  initPalette({ items: paletteItems, search: paletteSearch });
   initModelsUi({
     toast,
     models: () => state.models,
@@ -2343,7 +2547,7 @@ async function init() {
   initGitUi({
     workspace: () => (opts().kind === "code" ? opts().workspace : undefined),
     model: () => state.selectedModel || defaultModelFor("code"),
-    chatOptions,
+    chatOptions: (model, think) => chatOptions({ model }, think),
     toast,
     recordUsage: (model, p, c) => {
       api.recordUsage(today(), model, p, c).catch(() => {});
@@ -2363,7 +2567,7 @@ async function init() {
   await loadModels();
   // Ollama lancé après l'application : nouvelle tentative régulière tant qu'il est injoignable.
   window.setInterval(() => {
-    if (!connected() && !state.busy && !document.hidden) loadModels();
+    if (!connected() && !state.runs.size && !document.hidden) loadModels();
   }, 15000);
   renderUsage();
   updaterSupported = await api.updaterSupported().catch(() => false);

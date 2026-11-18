@@ -36,6 +36,8 @@ export interface Settings {
   /** Termes à favoriser (un par ligne ou séparés par des virgules). */
   transcriptionVocabulary: string;
   encryptData: boolean;
+  /** L'accueil guidé a été terminé. */
+  onboarded: boolean;
   settingsVersion?: number;
 }
 
@@ -124,6 +126,13 @@ export interface Usage {
   completionTokens: number;
 }
 
+/** Réglages de génération propres à une conversation (champ absent = réglage global). */
+export interface ConvParams {
+  temperature?: number | null;
+  numCtx?: number | null;
+  think?: boolean | null;
+}
+
 export type Kind = "chat" | "code";
 export type PermissionMode = "ask" | "acceptEdits" | "auto";
 
@@ -135,6 +144,7 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   systemPrompt: string | null;
+  params?: ConvParams;
   messages: Message[];
   workspace?: string;
   permissionMode?: PermissionMode;

@@ -177,13 +177,15 @@ async function startPull(name: string) {
   }
 }
 
-export async function openModelsDialog() {
+/** `pullName` : lance aussitôt le téléchargement de ce modèle (accueil guidé). */
+export async function openModelsDialog(pullName?: string) {
   const dlg = $<HTMLDialogElement>("#models-dialog");
   const st = await api.serverStatus().catch(() => null);
   $("#md-server").textContent = st?.version ? `Ollama ${st.version} · ${st.url}` : st?.error ?? "";
   await deps.reload();
   await refresh();
   if (!dlg.open) dlg.showModal();
+  if (pullName) startPull(pullName);
   clearInterval(poll);
   poll = window.setInterval(() => {
     if (!dlg.open) return clearInterval(poll);

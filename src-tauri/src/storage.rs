@@ -59,6 +59,8 @@ pub struct Settings {
     pub transcription_vocabulary: String,
     /// Chiffrement des conversations, projets et mcp.json (clé dans le trousseau du système).
     pub encrypt_data: bool,
+    /// L'accueil guidé (serveur, premier modèle, prise en main) a été terminé.
+    pub onboarded: bool,
     /// Version du format des réglages, pour les migrations (absent = 0).
     #[serde(default)]
     pub settings_version: u32,
@@ -112,6 +114,7 @@ impl Default for Settings {
             transcription_language: "fr".into(),
             transcription_vocabulary: String::new(),
             encrypt_data: true,
+            onboarded: false,
             settings_version: SETTINGS_VERSION,
         }
     }

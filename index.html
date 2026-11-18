@@ -28,7 +28,7 @@
             <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
             <span id="new-chat-label">Nouvelle conversation</span>
           </button>
-          <input id="search" type="search" placeholder="Rechercher…" autocomplete="off" />
+          <input id="search" type="search" placeholder="Rechercher…" autocomplete="off" title="Rechercher dans les conversations · Ctrl+K : palette de commandes" />
         </div>
         <nav id="conv-list"></nav>
         <div class="sidebar-bottom">
@@ -64,7 +64,12 @@
             <option value="auto">Autonome</option>
           </select>
           <select id="conv-project" title="Projet de la conversation" hidden></select>
-          <select id="model-select" title="Modèle"></select>
+          <button type="button" id="model-btn" class="model-btn">
+            <span></span><svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+          <button type="button" id="conv-settings-btn" class="icon-btn" title="Réglages de cette conversation">
+            <svg viewBox="0 0 24 24"><path d="M4 6h8M16 6h4M4 12h3M11 12h9M4 18h10M18 18h2" /><circle cx="14" cy="6" r="2" /><circle cx="9" cy="12" r="2" /><circle cx="16" cy="18" r="2" /></svg>
+          </button>
           <button id="models-btn" class="icon-btn" title="Gérer les modèles Ollama (Ctrl+M)">
             <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /><path d="M3.3 7 12 12l8.7-5M12 22V12" /></svg>
           </button>
@@ -479,6 +484,13 @@
       </div>
     </dialog>
 
+    <dialog id="palette">
+      <input id="palette-input" placeholder="Rechercher une action, une conversation, un modèle…" autocomplete="off" spellcheck="false" />
+      <div id="palette-list"></div>
+      <div class="pal-foot"><span><kbd>↑</kbd><kbd>↓</kbd> naviguer</span><span><kbd>Entrée</kbd> ouvrir</span><span><kbd>Échap</kbd> fermer</span></div>
+    </dialog>
+
+    <div id="popover" class="popover" hidden></div>
     <div id="toast" hidden></div>
   </body>
 </html>

@@ -27,6 +27,11 @@ Tout s'exécute sur **votre** serveur Ollama (ce PC, une machine du LAN, un serv
 - Le modèle choisi est conservé pour les nouvelles conversations ; à défaut, un modèle **déjà chargé** est préféré (pas d'attente de chargement)
 
 ### Chat
+- **Plusieurs conversations en parallèle** : une réponse ou une tâche continue pendant que vous en lancez d'autres ; pastilles « en cours », « approbation requise » et « terminée » dans la barre latérale et sur les onglets Chat / Code
+- **Sélecteur de modèle** avec recherche, capacités (outils, vision, raisonnement), taille et modèles déjà en mémoire
+- **Réglages par conversation** (bouton curseurs) : instructions système, température, fenêtre de contexte, raisonnement
+- **Palette de commandes** (`Ctrl/⌘+K`) : actions, conversations (titres et contenu), modèles et projets au clavier
+- **Accueil guidé** au premier lancement : connexion au serveur, premier modèle, prise en main
 - Réponses en **streaming**, arrêt à tout moment (bouton ■ ou `Échap`), **vitesse de génération** (tok/s) affichée
 - **Raisonnement** (qwen3, magistral, deepseek-r1, gpt-oss…) dans un bloc repliable, désactivable
 - Rendu **Markdown** : tableaux, listes, blocs de code colorés avec bouton « Copier »
@@ -88,7 +93,7 @@ Configuration au **format de Claude Desktop** (Réglages → MCP), transports **
 Barre d'activité (attente du modèle, réflexion, rédaction, outil en cours, approbation), chronomètre et étapes ; **nouvel essai automatique** si Ollama est occupé (503) ou redémarre ; délais adaptés à l'inférence locale (10 min pour le chargement du modèle et la lecture de l'invite) ; **relance automatique** si l'agent annonce une action sans l'exécuter ; **consommation de tokens** par jour et par modèle (Réglages → Utilisation).
 
 ### Raccourcis
-`Ctrl/⌘+N` nouvelle conversation · `Ctrl/⌘+1` / `2` Chat / Code · `Ctrl/⌘+M` modèles · `Ctrl/⌘+K` recherche · `Ctrl/⌘+B` barre latérale · `Ctrl/⌘+,` réglages · `Ctrl/⌘+G` panneau Git · `Ctrl/⌘+Maj+D` dictée · `Échap` arrêter
+`Ctrl/⌘+N` nouvelle conversation · `Ctrl/⌘+1` / `2` Chat / Code · `Ctrl/⌘+M` modèles · `Ctrl/⌘+K` palette de commandes · `Ctrl/⌘+B` barre latérale · `Ctrl/⌘+,` réglages · `Ctrl/⌘+G` panneau Git · `Ctrl/⌘+Maj+D` dictée · `Échap` arrêter
 
 ## Vie privée et sécurité
 
@@ -175,7 +180,11 @@ cd src-tauri && cargo test   # tests, dont le client Ollama contre un faux serve
 
 ```
 src/                    Interface (TypeScript, sans framework)
-  main.ts               État, rendu, boucle d'agent, pièces jointes, réglages
+  main.ts               État, rendu, boucle d'agent (une exécution par conversation), pièces jointes, réglages
+  model-picker.ts       Sélecteur de modèle
+  conv-settings.ts      Réglages par conversation
+  palette.ts            Palette de commandes
+  popover.ts            Panneaux flottants
   models-ui.ts          Gestionnaire de modèles (en mémoire, installés, téléchargement)
   agent.ts              Invites système, conversion API, politique d'approbation, cartes d'outils
   markdown.ts           marked + highlight.js + DOMPurify
