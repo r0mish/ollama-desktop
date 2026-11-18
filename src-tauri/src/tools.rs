@@ -216,7 +216,7 @@ pub fn definitions(ctx: &ToolContext, mcp: &McpManager, shell: &crate::shell::Sh
             risk: "read",
             definition: func(
                 "search_project_files",
-                "Recherche des passages dans les fichiers de référence du projet (recherche par mots-clés, locale). Formule des mots-clés précis ; relance avec d'autres termes si le résultat ne suffit pas.",
+                "Recherche des passages dans les fichiers de référence du projet (recherche locale, par mots-clés et par le sens si un modèle d'embedding est configuré). Formule une question ou des mots-clés précis ; relance avec d'autres termes si le résultat ne suffit pas.",
                 json!({ "query": { "type": "string", "description": "Mots-clés ou question" } }),
                 &["query"],
             ),
@@ -318,6 +318,8 @@ pub struct RunEnv<'a> {
     pub live: Option<crate::workspace::Live>,
     /// Mot de passe sudo saisi pour cette commande.
     pub sudo: Option<String>,
+    /// Recherche sémantique dans le projet : serveur d'embedding et fichier d'index.
+    pub embed: Option<(crate::embed::EmbedConn, std::path::PathBuf)>,
 }
 
 /// Annule une écriture de l'agent : remet le contenu précédent, ou supprime le fichier créé.
@@ -379,7 +381,13 @@ async fn run_inner(ctx: &ToolContext, env: RunEnv<'_>, name: &str, arguments: &s
         }
         "search_project_files" => {
             let p = env.project.as_ref().ok_or("Aucun projet associé à cette conversation")?;
-            let found = crate::knowledge::search(p, s(&args, "query")?, crate::knowledge::TOOL_BUDGET);
+            let query = s(&args, "query")?;
+            // Recherche par le sens si un index est disponible ; sinon mots-clés seuls.
+            let semantic = match &env.embed {
+                Some((conn, index)) => crate::embed::rank(index, conn, &crate::knowledge::chunks(p), query, &|_, _| {}).await.ok(),
+                None => None,
+            };
+            let found = crate::knowledge::search(p, query, crate::knowledge::TOOL_BUDGET, semantic.as_deref());
             Ok(text(if found.is_empty() { "Aucun passage ne correspond ; essaie d'autres mots-clés.".into() } else { found }))
         }
         "git_status" => Ok(text(git::status_text(&git::status(&target()?).await?))),

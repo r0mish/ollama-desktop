@@ -35,6 +35,7 @@ import { findProject, initProjectsUi, loadProjects, openProjectDialog, projectCh
 import { cancelDictation, initDictation, toggleDictation } from "./dictation";
 import { initModelsUi, openModelsDialog } from "./models-ui";
 import { initPopover } from "./popover";
+import { closePreview, initPreview, openPreview, type PreviewKind } from "./preview";
 import { commitServerForm, initServersUi, renderServerChip, renderServers, serversDraft } from "./servers-ui";
 import { initModelPicker, openModelMenu, renderModelButton } from "./model-picker";
 import { assistants, initAssistantsUi, loadAssistants, openAssistantsDialog } from "./assistants-ui";
@@ -149,7 +150,10 @@ const state = {
   platform: { os: "linux", shell: "sh", shellPath: "", shellGuidance: "", version: "" },
   /** Serveur Ollama : version (connecté) ou erreur. */
   server: null as ServerStatus | null,
+  /** Modèles de chat installés sur le serveur. */
   models: [] as ModelInfo[],
+  /** Tous les modèles installés, modèles d'embedding compris (gestionnaire de modèles). */
+  allModels: [] as ModelInfo[],
   modelsLoaded: false,
   /** Modèles chargés en mémoire par Ollama (réponse immédiate). */
   loaded: [] as string[],
@@ -192,6 +196,7 @@ const viewing = (conv: Conversation) => state.current === conv;
 const sudoCache = new Map<string, string>();
 /** Machine sur laquelle s'exécutent les commandes d'une conversation : serveur SSH ou cet ordinateur. */
 const sudoTarget = (conv: Conversation) => parseRemote(conv.workspace)?.hostId ?? "local";
+let embedWarned = false;
 /** Conversations supprimées pendant leur exécution : plus aucune sauvegarde. */
 const deletedConvs = new Set<string>();
 
@@ -297,7 +302,8 @@ async function loadModels() {
     .catch((e) => ({ id: srv?.id ?? "", name: srv?.name ?? "Ollama", url: srv?.url ?? "", tunnel: null, version: null, error: errMsg(e), insecure: false }));
   if (connected()) {
     try {
-      state.models = await api.listModels();
+      state.allModels = await api.listModels();
+      state.models = state.allModels.filter((m) => m.completion);
       state.modelsLoaded = true;
     } catch (e) {
       toast(`Liste des modèles indisponible : ${errMsg(e)}`, true);
@@ -328,7 +334,7 @@ async function applyServers(servers: Server[], activeServer: string) {
   await api.saveSettings(next);
   state.settings = next;
   state.server = null;
-  state.models = [];
+  state.models = state.allModels = [];
   state.modelsLoaded = false;
   renderServerChip();
   if (!state.current) renderWelcome();
@@ -1041,8 +1047,8 @@ function messageHtml(m: Message, next: Message | undefined): string {
     return `<div class="msg auto" data-id="${m.id}">↻ Relance automatique : l'agent avait annoncé une action sans l'exécuter</div>`;
   }
   if (m.role === "user") {
-    const imgs = (m.images ?? []).map((src) => `<img src="${src}" alt="image jointe" />`).join("");
-    const files = (m.files ?? []).map((f) => `<span class="chip">${icons.file}${escapeHtml(f.name)}</span>`).join("");
+    const imgs = (m.images ?? []).map((src, i) => `<img src="${src}" alt="image jointe" data-image="${i}" title="Agrandir" />`).join("");
+    const files = (m.files ?? []).map((f, i) => `<button type="button" class="chip" data-file="${i}" title="Afficher le contenu">${icons.file}${escapeHtml(f.name)}</button>`).join("");
     return `<div class="msg user" data-id="${m.id}">
       ${imgs || files ? `<div class="msg-attachments">${imgs}${files}</div>` : ""}
       <div class="bubble">${escapeHtml(m.content).replace(/\n/g, "<br>")}</div>
@@ -1058,7 +1064,7 @@ function messageHtml(m: Message, next: Message | undefined): string {
     : "";
   const tools = (m.toolCalls ?? []).map((tc) => toolCardHtml(tc, state.risks.get(tc.name) ?? guessRisk(tc.name))).join("");
   const body = m.content
-    ? renderMarkdown(m.content)
+    ? linkCitations(renderMarkdown(m.content))
     : streaming && !m.reasoning && !tools ? '<span class="typing"><i></i><i></i><i></i></span>' : "";
   const meta = [m.model, m.usage ? `${m.usage.promptTokens} → ${m.usage.completionTokens} tokens` : "", fmtSpeed(m.usage?.tokensPerSec), m.cancelled ? "interrompu" : ""]
     .filter(Boolean)
@@ -1107,6 +1113,14 @@ function messageHtml(m: Message, next: Message | undefined): string {
   return `<div class="msg assistant${streaming ? " streaming" : ""}" data-id="${m.id}">
     ${reasoning}${body ? `<div class="md">${body}</div>` : ""}${tools ? `<div class="tools">${tools}</div>` : ""}${error}${actions}
   </div>`;
+}
+
+/** Rend cliquables les noms de fichiers de référence du projet cités dans une réponse. */
+function linkCitations(html: string): string {
+  const files = findProject(state.current?.projectId)?.files;
+  if (!files?.length) return html;
+  const names = new Set(files.map((f) => escapeHtml(f.name)));
+  return html.replace(/<code>([^<]+)<\/code>/g, (all, name) => (names.has(name) ? `<code class="cite" title="Ouvrir ce fichier de référence">${name}</code>` : all));
 }
 
 /** Risque déduit du nom quand la définition n'est pas (encore) chargée. */
@@ -1227,6 +1241,29 @@ el.messages.addEventListener("click", async (ev) => {
   }
   if (t.closest("[data-undo-turn]")) return undoTurn(t.closest<HTMLElement>("[data-undo-turn]")!);
   if (t.closest("[data-run-plan]")) return runPlan();
+
+  const previewBtn = t.closest<HTMLElement>(".preview-code");
+  if (previewBtn) {
+    const code = previewBtn.closest(".code-block")?.querySelector("code")?.textContent ?? "";
+    const kind = previewBtn.dataset.kind as PreviewKind;
+    return openPreview({ title: kind === "svg" ? "Aperçu SVG" : "Aperçu HTML", kind, content: code });
+  }
+  // Pièces jointes d'un message et fichiers de référence cités : affichage dans le panneau d'aperçu.
+  const attached = t.closest<HTMLElement>("[data-image], [data-file]");
+  if (attached && state.current) {
+    const m = state.current.messages.find((x) => x.id === attached.closest<HTMLElement>(".msg")?.dataset.id);
+    const image = m?.images?.[Number(attached.dataset.image)];
+    const file = m?.files?.[Number(attached.dataset.file)];
+    if (attached.dataset.image !== undefined && image) return openPreview({ title: "Image jointe", kind: "image", content: image });
+    if (file) return openPreview({ title: file.name, kind: "text", content: file.text });
+    return;
+  }
+  const cite = t.closest<HTMLElement>("code.cite");
+  if (cite) {
+    const file = findProject(state.current?.projectId)?.files.find((f) => f.name === cite.textContent);
+    if (file) openPreview({ title: file.name, kind: "text", content: file.text });
+    return;
+  }
 
   const codeBtn = t.closest<HTMLElement>(".copy-code");
   if (codeBtn) {
@@ -1851,7 +1888,15 @@ async function runAgent() {
     const question = [...conv.messages].reverse().find((m) => m.role === "user" && !m.auto)?.content ?? "";
     setActivity(run, "Recherche dans les fichiers du projet…");
     try {
-      state.projectCtx.set(conv.id, await api.projectContext(conv.projectId, question));
+      const ctx = await api.projectContext(conv.projectId, question, (done, total) =>
+        setActivity(run, "Indexation du projet…", `${done}/${total} extraits (une seule fois par extrait)`),
+      );
+      state.projectCtx.set(conv.id, ctx);
+      // Recherche par le sens indisponible (modèle absent…) : mots-clés seuls, signalé une fois.
+      if (ctx.search !== "semantic" && ctx.search !== "keywords" && !embedWarned) {
+        embedWarned = true;
+        toast(`Recherche sémantique indisponible, mots-clés seuls : ${ctx.search}`, true);
+      }
     } catch {
       state.projectCtx.delete(conv.id);
     }
@@ -2026,7 +2071,10 @@ function renderChanges() {
 
 el.changesBtn.addEventListener("click", () => {
   el.changesPanel.hidden = !el.changesPanel.hidden;
-  if (!el.changesPanel.hidden) toggleGitPanel(false);
+  if (!el.changesPanel.hidden) {
+    toggleGitPanel(false);
+    closePreview();
+  }
   renderChanges();
 });
 $("#changes-close").addEventListener("click", () => (el.changesPanel.hidden = true));
@@ -2140,13 +2188,19 @@ el.exportBtn.addEventListener("click", async () => {
 function renderAttachments() {
   const { images, files } = state.pending;
   el.attachments.innerHTML =
-    images.map((src, i) => `<span class="att img"><img src="${src}" alt="" /><button type="button" data-rm="img:${i}" title="Retirer">×</button></span>`).join("") +
-    files.map((f, i) => `<span class="att chip">${icons.file}${escapeHtml(f.name)}<button type="button" data-rm="file:${i}" title="Retirer">×</button></span>`).join("");
+    images.map((src, i) => `<span class="att img" data-show="img:${i}" title="Agrandir"><img src="${src}" alt="" /><button type="button" data-rm="img:${i}" title="Retirer">×</button></span>`).join("") +
+    files.map((f, i) => `<span class="att chip" data-show="file:${i}" title="Afficher le contenu">${icons.file}${escapeHtml(f.name)}<button type="button" data-rm="file:${i}" title="Retirer">×</button></span>`).join("");
 }
 
 el.attachments.addEventListener("click", (e) => {
   const rm = (e.target as HTMLElement).dataset.rm;
-  if (!rm) return;
+  if (!rm) {
+    const [kind, i] = ((e.target as HTMLElement).closest<HTMLElement>("[data-show]")?.dataset.show ?? "").split(":");
+    const file = state.pending.files[+i];
+    if (kind === "img" && state.pending.images[+i]) openPreview({ title: "Image jointe", kind: "image", content: state.pending.images[+i] });
+    else if (kind === "file" && file?.text) openPreview({ title: file.name, kind: "text", content: file.text });
+    return;
+  }
   const [kind, i] = rm.split(":");
   if (kind === "img") state.pending.images.splice(+i, 1);
   else state.pending.files.splice(+i, 1);
@@ -2179,6 +2233,71 @@ async function imageToDataUrl(file: File): Promise<string> {
   return canvas.toDataURL("image/jpeg", 0.88);
 }
 
+const OCR_PROMPT =
+  "Transcris fidèlement tout le texte de cette page de document, en Markdown (titres, listes, tableaux). " +
+  "N'ajoute ni commentaire ni traduction ; si la page ne contient aucun texte, réponds « (page sans texte) ».";
+
+/** Réduit une image (data URL) à la taille maximale envoyée aux modèles vision. */
+async function shrinkImage(url: string): Promise<string> {
+  const img = new Image();
+  await new Promise((res, rej) => {
+    img.onload = res;
+    img.onerror = () => rej(new Error("image illisible"));
+    img.src = url;
+  });
+  const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(img.width, img.height));
+  if (scale === 1) return url;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  canvas.getContext("2d")!.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.88);
+}
+
+/**
+ * Lit un PDF scanné : chaque page est transcrite par le modèle vision des réglages, sur le
+ * serveur Ollama. `cancelled` : l'utilisateur a retiré la pièce jointe.
+ */
+async function readScannedPdf(name: string, b64: string, progress: (page: number, pages: number) => void, cancelled: () => boolean = () => false): Promise<string> {
+  const model = state.settings.ocrModel;
+  if (!model) throw new Error("PDF scanné (sans texte) : choisissez un modèle vision dans Réglages → Outils → Documents PDF pour le lire");
+  if (!modelInfo(model)) throw new Error(`PDF scanné : le modèle vision ${model} n'est pas installé sur ce serveur`);
+  const { images, pages, skipped } = await api.pdfPageImages(b64);
+  if (!images.length) throw new Error("PDF scanné dans un format d'image non pris en charge (CCITT, JBIG2 ou JPEG 2000) : convertissez-le en images");
+  const parts: string[] = [];
+  for (const [i, image] of images.entries()) {
+    if (cancelled()) throw new Error("lecture annulée");
+    progress(i + 1, images.length);
+    let text = "";
+    const requestId = uid();
+    const watch = window.setInterval(() => cancelled() && api.cancel(requestId).catch(() => {}), 500);
+    try {
+      await api.chat(
+        requestId,
+        {
+          model,
+          messages: [{ role: "user", content: OCR_PROMPT, images: [await shrinkImage(image)] }],
+          temperature: 0,
+          maxTokens: 4000,
+          tools: [],
+          ...chatOptions({ model }, false),
+        },
+        (ev) => {
+          if (ev.type === "delta") text += ev.text;
+          else if (ev.type === "usage") api.recordUsage(today(), model, ev.promptTokens, ev.completionTokens).catch(() => {});
+        },
+      );
+    } finally {
+      clearInterval(watch);
+    }
+    parts.push(`<!-- page ${i + 1} -->\n${text.trim()}`);
+  }
+  if (cancelled()) throw new Error("lecture annulée");
+  const missing = pages - images.length - skipped;
+  if (skipped || missing > 0) toast(`${name} : ${images.length} page(s) lue(s) sur ${pages}${skipped ? `, ${skipped} dans un format non pris en charge` : ""}`);
+  return parts.join("\n\n");
+}
+
 async function addPdf(file: File) {
   if (file.size > MAX_PDF) throw new Error(`trop volumineux (max ${MAX_PDF / 1048576} Mo)`);
   const placeholder: TextFile = { name: `${file.name} (conversion…)`, text: "" };
@@ -2186,9 +2305,15 @@ async function addPdf(file: File) {
   renderAttachments();
   try {
     const b64 = (await readAsDataUrl(file)).split(",")[1];
-    const { text } = await api.processDocument(b64);
+    const res = await api.processDocument(b64);
+    const text = res.scanned
+      ? await readScannedPdf(file.name, b64, (page, pages) => {
+          placeholder.name = `${file.name} (lecture de la page ${page}/${pages}…)`;
+          renderAttachments();
+        }, () => !state.pending.files.includes(placeholder))
+      : res.text;
     if (!text.trim()) throw new Error("aucun texte extrait");
-    placeholder.name = file.name;
+    placeholder.name = res.scanned ? `${file.name} (lu par ${state.settings.ocrModel})` : file.name;
     placeholder.text = text;
   } catch (e) {
     state.pending.files.splice(state.pending.files.indexOf(placeholder), 1);
@@ -2275,6 +2400,8 @@ const s = {
   keep: $<HTMLInputElement>("#s-keep"),
   thinking: $<HTMLInputElement>("#s-thinking"),
   searx: $<HTMLInputElement>("#s-searx"),
+  embed: $<HTMLInputElement>("#s-embed"),
+  ocr: $<HTMLSelectElement>("#s-ocr"),
   webDefault: $<HTMLInputElement>("#s-web-default"),
   codeModel: $<HTMLSelectElement>("#s-code-model"),
   timeout: $<HTMLInputElement>("#s-timeout"),
@@ -2569,6 +2696,13 @@ async function openSettings(tab = "general") {
   s.theme.value = st.theme;
   s.enter.checked = st.sendOnEnter;
   s.searx.value = st.searxngUrl;
+  s.embed.value = st.embeddingModel ?? "";
+  const embedIds = [...new Set([...state.allModels.filter((m) => m.embedding).map((m) => m.id), "bge-m3", "nomic-embed-text", "embeddinggemma"])];
+  $("#embed-models").innerHTML = embedIds.map((id) => `<option value="${escapeHtml(id)}"></option>`).join("");
+  const vision = state.models.filter((m) => m.vision).map((m) => m.id);
+  if (st.ocrModel && !vision.includes(st.ocrModel)) vision.unshift(st.ocrModel);
+  s.ocr.innerHTML = '<option value="">Désactivé</option>' + vision.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
+  s.ocr.value = st.ocrModel ?? "";
   s.webDefault.checked = st.webSearchDefault;
   s.timeout.value = String(st.commandTimeout);
   s.maxSteps.value = String(st.maxSteps);
@@ -2618,6 +2752,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
     theme: s.theme.value as Settings["theme"],
     sendOnEnter: s.enter.checked,
     searxngUrl: s.searx.value.trim(),
+    embeddingModel: s.embed.value.trim(),
+    ocrModel: s.ocr.value,
     webSearchDefault: s.webDefault.checked,
     codeModel: s.codeModel.value,
     commandTimeout: Math.max(5, Number(s.timeout.value) || 120),
@@ -2660,9 +2796,10 @@ $("#settings-form").addEventListener("submit", async (e) => {
       state.draft.webSearch = next.webSearchDefault;
     }
     el.settings.close();
+    if (next.embeddingModel !== state.settings.embeddingModel) embedWarned = false;
     if (baseChanged) {
       state.server = null;
-      state.models = [];
+      state.models = state.allModels = [];
       state.modelsLoaded = false;
       await loadModels();
     }
@@ -2825,6 +2962,14 @@ async function init() {
     onChange: onProjectChange,
     toast,
     onWorkspaceAdded: () => api.listWorkspaces().then((w) => (state.workspaces = w)).catch(() => {}),
+    readScanned: readScannedPdf,
+  });
+  initPreview({
+    toast,
+    onOpen: () => {
+      el.changesPanel.hidden = true;
+      toggleGitPanel(false);
+    },
   });
   initDictation({ input: el.input, toast });
   initPopover();
@@ -2888,7 +3033,7 @@ async function init() {
   });
   initModelsUi({
     toast,
-    models: () => state.models,
+    models: () => state.allModels,
     reload: loadModels,
     numCtx: contextFor,
     use: pickModel,

@@ -1,7 +1,9 @@
 mod audio;
+mod embed;
 mod git;
 mod mcp;
 mod ollama;
+mod pdfscan;
 mod shell;
 mod ssh;
 mod storage;
@@ -386,12 +388,13 @@ struct ToolCallReq {
 async fn run_tool(
     app: AppHandle,
     streams: State<'_, Streams>,
-    mcp: State<'_, Arc<McpManager>>,
     request_id: String,
     ctx: ToolContext,
     call: ToolCallReq,
     on_output: Channel<String>,
 ) -> CmdResult<ToolOutput> {
+    let mcp = app.state::<Arc<McpManager>>();
+    let tunnels = app.state::<Arc<tunnel::Tunnels>>();
     let ToolCallReq { name, arguments, sudo_password } = call;
     let settings = storage::load_settings(&app)?;
     let approved = storage::load_workspaces(&app);
@@ -403,7 +406,11 @@ async fn run_tool(
         let _ = on_output.send(text);
     });
     let sudo = sudo_password.filter(|p| !p.is_empty() && !p.contains(['\n', '\r']));
-    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project, live: Some(live), sudo };
+    let embed = match (&ctx.project, name.as_str()) {
+        (Some(id), "search_project_files") => embed_for(&app, &tunnels, id).await,
+        _ => None,
+    };
+    let env = tools::RunEnv { settings: &settings, approved: &approved, hosts: &hosts, mcp: &mcp, cancel: cancel.clone(), project, live: Some(live), sudo, embed };
     let out = if name == "run_command" {
         // La commande gère elle-même l'annulation (arrêt du groupe de processus).
         tools::run(&ctx, env, &name, &arguments).await
@@ -475,12 +482,57 @@ fn save_project(app: AppHandle, project: storage::Project) -> CmdResult<()> {
     storage::save_project(&app, &project)
 }
 
+/// Serveur d'embedding et fichier d'index d'un projet, si la recherche sémantique est configurée.
+async fn embed_for(app: &AppHandle, tunnels: &tunnel::Tunnels, project_id: &str) -> Option<(embed::EmbedConn, std::path::PathBuf)> {
+    let settings = storage::load_settings(app).ok()?;
+    let model = settings.embedding_model.trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
+    let c = conn(app, tunnels).await.ok()?;
+    Some((embed::EmbedConn { base: c.base, key: c.key, model }, storage::project_index_path(app, project_id).ok()?))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectContextOut {
+    #[serde(flatten)]
+    context: knowledge::ProjectContext,
+    /// « semantic » (mots-clés + sens), « keywords », ou la raison pour laquelle le sens n'a pas servi.
+    search: String,
+}
+
 /// Fichiers de référence à joindre pour une question : en entier, ou extraits pertinents (gros projets).
+/// `on_progress` : avancement de l'indexation sémantique (extraits faits, total).
 #[tauri::command]
-async fn project_context(app: AppHandle, id: String, query: String) -> CmdResult<knowledge::ProjectContext> {
-    tauri::async_runtime::spawn_blocking(move || storage::load_project(&app, &id).map(|p| knowledge::context(&p, &query)))
+async fn project_context(
+    app: AppHandle,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
+    id: String,
+    query: String,
+    on_progress: Channel<[usize; 2]>,
+) -> CmdResult<ProjectContextOut> {
+    let project = storage::load_project(&app, &id)?;
+    let mut search = "keywords".to_string();
+    let mut semantic = None;
+    if knowledge::total_chars(&project) > knowledge::FULL_CONTEXT_CHARS {
+        if let Some((conn, index)) = embed_for(&app, &tunnels, &id).await {
+            let progress = move |done: usize, total: usize| {
+                let _ = on_progress.send([done, total]);
+            };
+            match embed::rank(&index, &conn, &knowledge::chunks(&project), &query, &progress).await {
+                Ok(order) => {
+                    semantic = Some(order);
+                    search = "semantic".into();
+                }
+                // Modèle absent, serveur occupé… : la recherche par mots-clés prend le relais.
+                Err(e) => search = e,
+            }
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || ProjectContextOut { context: knowledge::context(&project, &query, semantic.as_deref()), search })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -698,6 +750,8 @@ async fn git_init(app: AppHandle, workspace: String) -> CmdResult<()> {
 struct DocumentText {
     text: String,
     method: &'static str,
+    /// PDF sans texte extractible : à faire lire par un modèle vision (`pdf_page_images`).
+    scanned: bool,
 }
 
 fn extract_pdf_local(bytes: Vec<u8>) -> CmdResult<(String, usize)> {
@@ -720,10 +774,22 @@ async fn process_document(data_base64: String) -> CmdResult<DocumentText> {
         .map_err(|_| "L'extraction a échoué sur ce PDF".to_string())?
         .map_err(|e| format!("Extraction impossible : {e}"))?;
     // Presque pas de texte : PDF scanné (images de pages).
-    if text.trim().chars().count() < 20 * pages {
-        return Err("Ce PDF semble scanné (pas de texte extractible). Joignez plutôt des captures des pages à un modèle vision (gemma3, qwen2.5vl, mistral-small3.2…).".into());
-    }
-    Ok(DocumentText { text, method: "local" })
+    let scanned = text.trim().chars().count() < 20 * pages;
+    Ok(DocumentText { text: if scanned { String::new() } else { text }, method: "local", scanned })
+}
+
+/// Pages lues au plus dans un PDF scanné (une requête au modèle vision par page).
+const MAX_SCANNED_PAGES: usize = 40;
+
+/// Images des pages d'un PDF scanné, pour les faire transcrire par un modèle vision.
+#[tauri::command]
+async fn pdf_page_images(data_base64: String) -> CmdResult<pdfscan::PageImages> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| format!("Fichier illisible : {e}"))?;
+    tokio::task::spawn_blocking(move || pdfscan::page_images(&bytes, MAX_SCANNED_PAGES))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ------------------------------------------------------------------ MCP
@@ -899,6 +965,7 @@ pub fn run() {
             forget_workspace,
             touch_workspace,
             process_document,
+            pdf_page_images,
             mcp_get_config,
             mcp_save_config,
             mcp_restart,

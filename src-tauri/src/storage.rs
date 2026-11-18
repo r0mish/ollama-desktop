@@ -76,6 +76,10 @@ pub struct Settings {
     pub transcription_vocabulary: String,
     /// Chiffrement des conversations, projets et mcp.json (clé dans le trousseau du système).
     pub encrypt_data: bool,
+    /// Modèle d'embedding Ollama pour la recherche sémantique dans les projets (vide = mots-clés seuls).
+    pub embedding_model: String,
+    /// Modèle vision utilisé pour lire les PDF scannés (vide = désactivé).
+    pub ocr_model: String,
     /// L'accueil guidé (serveur, premier modèle, prise en main) a été terminé.
     pub onboarded: bool,
     /// Version du format des réglages, pour les migrations (absent = 0).
@@ -151,6 +155,8 @@ impl Default for Settings {
             transcription_language: "fr".into(),
             transcription_vocabulary: String::new(),
             encrypt_data: true,
+            embedding_model: String::new(),
+            ocr_model: String::new(),
             onboarded: false,
             settings_version: SETTINGS_VERSION,
         }
@@ -266,7 +272,8 @@ fn secret_files(app: &AppHandle) -> R<Vec<PathBuf>> {
     let mut out = Vec::new();
     for dir in [conv_dir(app)?, projects_dir(app)?] {
         for e in fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
+            // `.emb` : index sémantique d'un projet.
+            if matches!(e.path().extension().and_then(|x| x.to_str()), Some("json" | "emb")) {
                 out.push(e.path());
             }
         }
@@ -580,7 +587,14 @@ pub fn delete_project(app: &AppHandle, id: &str) -> R<()> {
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
+    let _ = fs::remove_file(project_index_path(app, id)?);
     Ok(())
+}
+
+/// Index sémantique (embeddings) des fichiers de référence d'un projet.
+pub fn project_index_path(app: &AppHandle, id: &str) -> R<PathBuf> {
+    check_id(id)?;
+    Ok(projects_dir(app)?.join(format!("{id}.emb")))
 }
 
 fn ssh_hosts_path(app: &AppHandle) -> R<PathBuf> {

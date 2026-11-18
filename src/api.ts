@@ -37,6 +37,10 @@ export interface Settings {
   /** Termes à favoriser (un par ligne ou séparés par des virgules). */
   transcriptionVocabulary: string;
   encryptData: boolean;
+  /** Modèle d'embedding pour la recherche sémantique dans les projets (vide = mots-clés seuls). */
+  embeddingModel: string;
+  /** Modèle vision qui lit les PDF scannés (vide = désactivé). */
+  ocrModel: string;
   /** L'accueil guidé a été terminé. */
   onboarded: boolean;
   settingsVersion?: number;
@@ -55,6 +59,10 @@ export interface ModelInfo {
   thinking: boolean;
   maxContextLength: number | null;
   remote: boolean;
+  /** Utilisable en chat. */
+  completion: boolean;
+  /** Modèle d'embedding (recherche sémantique). */
+  embedding: boolean;
 }
 
 export interface RunningModel {
@@ -236,6 +244,8 @@ export interface SearchHit {
 export interface ProjectContext {
   mode: "full" | "excerpts";
   text: string;
+  /** « semantic », « keywords », ou la raison pour laquelle la recherche par le sens a échoué. */
+  search: string;
 }
 
 export interface VaultStatus {
@@ -444,7 +454,11 @@ export const api = {
   dictationStop: (transcribe: boolean) => invoke<string | null>("dictation_stop", { transcribe }),
 
   searchConversations: (query: string) => invoke<SearchHit[]>("search_conversations", { query }),
-  projectContext: (id: string, query: string) => invoke<ProjectContext>("project_context", { id, query }),
+  projectContext(id: string, query: string, onProgress?: (done: number, total: number) => void): Promise<ProjectContext> {
+    const channel = new Channel<[number, number]>();
+    if (onProgress) channel.onmessage = ([done, total]) => onProgress(done, total);
+    return invoke<ProjectContext>("project_context", { id, query, onProgress: channel });
+  },
 
   vaultStatus: () => invoke<VaultStatus>("vault_status"),
   vaultExportKey: () => invoke<string>("vault_export_key"),
@@ -485,7 +499,9 @@ export const api = {
   forgetWorkspace: (path: string) => invoke<string[]>("forget_workspace", { path }),
   touchWorkspace: (path: string) => invoke<void>("touch_workspace", { path }),
 
-  processDocument: (dataBase64: string) => invoke<{ text: string; method: "local" }>("process_document", { dataBase64 }),
+  processDocument: (dataBase64: string) => invoke<{ text: string; method: "local"; scanned: boolean }>("process_document", { dataBase64 }),
+  /** Images des pages d'un PDF scanné (data URL), à faire lire par un modèle vision. */
+  pdfPageImages: (dataBase64: string) => invoke<{ images: string[]; pages: number; skipped: number }>("pdf_page_images", { dataBase64 }),
 
   mcpGetConfig: () => invoke<string>("mcp_get_config"),
   mcpSaveConfig: (text: string) => invoke<void>("mcp_save_config", { text }),

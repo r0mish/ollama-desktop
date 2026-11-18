@@ -1,6 +1,6 @@
 [package]
 name = "ollama-desktop"
-version = "0.5.0"
+version = "0.6.0"
 description = "Client de bureau léger et respectueux de la vie privée pour Ollama"
 authors = ["r0mish"]
 license = "MIT"
@@ -32,6 +32,9 @@ similar = "2"
 ignore = "0.4"
 regex = "1"
 pdf-extract = "0.12"
+# Déjà présents dans l'arbre de dépendances (pdf-extract, tauri) : PDF scannés.
+lopdf = { version = "0.42", default-features = false }
+png = "0.18"
 cpal = "0.18"
 chacha20poly1305 = "0.10"
 

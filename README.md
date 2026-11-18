@@ -47,7 +47,10 @@ Tout s'exécute sur **votre** serveur Ollama (ce PC, une machine du LAN, un serv
 ### Projets
 Comme dans Claude Desktop : des conversations regroupées qui partagent des **consignes** et des **fichiers de référence** (texte, Markdown, code, CSV, PDF).
 - **Dossier de travail** du projet (local ou serveur SSH) pour les sessions de code
-- **Gros projets** (au-delà de 60 000 caractères) : recherche locale BM25 par extraits, outil `search_project_files` pour le modèle. Aucun index ni embedding ne quitte la machine
+- **Gros projets** (au-delà de 60 000 caractères) : seuls les passages utiles sont envoyés (≈ 4 k tokens par message), et le modèle dispose d'un outil `search_project_files`
+  - recherche par **mots-clés** (BM25) par défaut, sans aucune dépendance
+  - recherche **sémantique** en option (Réglages → Outils) : avec un modèle d'embedding installé sur votre serveur Ollama (`bge-m3`, `nomic-embed-text`…), les synonymes et reformulations sont compris ; les deux classements sont fusionnés. L'index est calculé une fois par extrait, gardé chiffré sur cet appareil et mis à jour quand un fichier change
+- Les noms de fichiers de référence cités dans une réponse sont **cliquables** et ouvrent le fichier dans le panneau d'aperçu
 
 ### Agent de code (onglet **Code**)
 Un agent façon Claude Code, avec un modèle local gérant les outils (`devstral-small-2`, `qwen3-coder`, `qwen3`, `gpt-oss`…) :
@@ -80,7 +83,13 @@ Un agent façon Claude Code, avec un modèle local gérant les outils (`devstral
 Bascule **Web** dans la zone de saisie : `web_search` via votre instance **[SearXNG](https://docs.searxng.org)** (métamoteur libre, auto-hébergeable) et `fetch_url`. Les adresses du réseau local sont **bloquées** pour `fetch_url` (protection contre le sondage du LAN par une page piégée).
 
 ### PDF
-Extraction du texte **en local** (rien n'est envoyé). Un PDF scanné est signalé : joignez des captures des pages à un modèle vision.
+- Extraction du texte **en local**
+- **PDF scannés** : choisissez un modèle vision (Réglages → Outils) et chaque page est transcrite par ce modèle sur votre serveur Ollama. Les images de page sont extraites du PDF sans moteur de rendu : JPEG et pixels bruts sont pris en charge, pas les scans CCITT, JBIG2 ou JPEG 2000. 40 pages au plus par document
+
+### Aperçus
+- Bouton **Aperçu** sur les blocs de code HTML et SVG : rendu dans un panneau latéral, avec bascule Aperçu / Source
+- Rendu **isolé** : aucun script ne s'exécute, aucune ressource distante n'est chargée (pas de pixel de suivi possible)
+- Clic sur une image ou un fichier joint pour l'afficher dans le même panneau
 
 ### Dictée vocale
 Bouton micro (`Ctrl/⌘+Maj+D`), affiché une fois un **serveur de transcription auto-hébergé** configuré (Ollama ne transcrit pas l'audio) : toute API compatible `/v1/audio/transcriptions` ([Speaches](https://speaches.ai)/faster-whisper, whisper.cpp `server`, Voxtral via vLLM…). Son capté en mémoire uniquement, vocabulaire personnalisé, langue configurable.
@@ -199,6 +208,7 @@ src/                    Interface (TypeScript, sans framework)
   conv-settings.ts      Réglages par conversation
   palette.ts            Palette de commandes
   popover.ts            Panneaux flottants
+  preview.ts            Panneau d'aperçu (HTML, SVG, pièces jointes, fichiers de référence)
   models-ui.ts          Gestionnaire de modèles (en mémoire, installés, téléchargement)
   agent.ts              Invites système, conversion API, politique d'approbation, cartes d'outils
   markdown.ts           marked + highlight.js + DOMPurify
@@ -217,6 +227,8 @@ src-tauri/src/
   storage.rs            Stockage JSON atomique, export Markdown, recherche plein texte
   vault.rs              Chiffrement local (XChaCha20-Poly1305, clé dans le trousseau)
   textsearch.rs         Recherche locale : plein texte, BM25
+  embed.rs              Recherche sémantique : index d'embeddings chiffré, fusion avec BM25
+  pdfscan.rs            PDF scannés : images de page pour un modèle vision
   knowledge.rs          Fichiers de référence des projets
   audio.rs              Capture du micro (cpal), WAV 16 kHz en mémoire
   target.rs, ssh.rs     Dossier de projet local ou distant (OpenSSH), fichiers de consignes

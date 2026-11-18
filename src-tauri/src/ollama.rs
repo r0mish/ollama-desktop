@@ -87,6 +87,10 @@ pub struct ModelInfo {
     pub max_context_length: Option<u64>,
     /// Modèle exécuté sur un serveur distant (modèles « cloud »).
     pub remote: bool,
+    /// Utilisable en chat (les modèles d'embedding seuls ne le sont pas).
+    pub completion: bool,
+    /// Modèle d'embedding (recherche sémantique).
+    pub embedding: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +323,8 @@ pub async fn list_models(base: &str, key: &str) -> Result<Vec<ModelInfo>, String
                 thinking: false,
                 max_context_length: None,
                 remote: m["remote_host"].as_str().is_some_and(|h| !h.is_empty()),
+                completion: true,
+                embedding: false,
             })
         })
         .collect();
@@ -327,9 +333,8 @@ pub async fn list_models(base: &str, key: &str) -> Result<Vec<ModelInfo>, String
     let mut keep = Vec::with_capacity(models.len());
     for (mut m, s) in models.drain(..).zip(shows) {
         if let Some(s) = s {
-            if !is_chat_model(&s) {
-                continue;
-            }
+            m.completion = is_chat_model(&s);
+            m.embedding = s["capabilities"].as_array().is_some_and(|c| c.iter().any(|x| x == "embedding"));
             apply_show(&mut m, &s);
         }
         keep.push(m);
@@ -449,6 +454,30 @@ pub async fn preload_model(base: &str, key: &str, model: &str, keep_alive: &str,
         return Err(api_error(resp, Some(model)).await);
     }
     Ok(())
+}
+
+/// Embeddings d'une liste de textes (`/api/embed`), dans l'ordre des entrées.
+pub async fn embed(base: &str, key: &str, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    let resp = authed(client()?.post(endpoint(base, "embed")), key)
+        .json(&json!({ "model": model, "input": inputs, "truncate": true }))
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| connect_error(base, &e))?;
+    if !resp.status().is_success() {
+        return Err(api_error(resp, Some(model)).await);
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let out: Vec<Vec<f32>> = v["embeddings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| e.as_array().into_iter().flatten().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+        .collect();
+    if out.len() != inputs.len() || out.iter().any(Vec::is_empty) {
+        return Err(format!("Le modèle « {model} » n'a pas renvoyé d'embeddings : est-ce bien un modèle d'embedding (bge-m3, nomic-embed-text…) ?"));
+    }
+    Ok(out)
 }
 
 /// `keep_alive` : durée Go (« 10m », « 1h », « -1m ») ou nombre de secondes ; vide = défaut du serveur.
@@ -985,7 +1014,10 @@ mod tests {
         assert_eq!(version(&base, "").await.unwrap(), "0.13.5");
         let models = list_models(&base, "").await.unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["gemma3:4b", "qwen3:8b"]);
+        assert_eq!(ids, ["gemma3:4b", "nomic-embed-text:latest", "qwen3:8b"]);
+        assert!(models[1].embedding && !models[1].completion);
+        assert!(models[0].completion && !models[0].embedding);
+        let models: Vec<ModelInfo> = models.into_iter().filter(|m| m.completion).collect();
         assert!(models[0].vision && !models[0].tools && !models[0].thinking);
         assert!(models[1].tools && models[1].thinking && !models[1].vision);
         assert_eq!(models[1].max_context_length, Some(40960));
@@ -1025,5 +1057,68 @@ mod tests {
         unload_model(&base, "", "qwen3:0.6b").await.unwrap();
         let log = seen.lock().unwrap();
         assert_eq!(log.last().unwrap().1["keep_alive"], 0);
+    }
+
+    /// Faux modèle d'embedding : un axe par thème, selon les mots présents.
+    fn fake_embedding(text: &str) -> Vec<f32> {
+        let t = text.to_lowercase();
+        let axis = |words: &[&str]| words.iter().filter(|w| t.contains(*w)).count() as f32;
+        vec![
+            axis(&["sauvegarde", "backup", "restauration", "archiv"]),
+            axis(&["réseau", "vlan", "pare-feu", "routeur"]),
+            axis(&["jardin", "météo", "tomate"]),
+            0.01,
+        ]
+    }
+
+    #[tokio::test]
+    async fn semantic_ranking_uses_and_caches_embeddings() {
+        let (base, seen) = mock(|path, body| match path {
+            "/api/embed" => {
+                let vectors: Vec<Vec<f32>> = body["input"].as_array().unwrap().iter().map(|t| fake_embedding(t.as_str().unwrap())).collect();
+                (200, json!({ "embeddings": vectors }).to_string())
+            }
+            _ => (404, json!({ "error": "not found" }).to_string()),
+        })
+        .await;
+        let chunk = |source: &str, text: &str| crate::textsearch::Chunk { source: source.into(), text: text.into() };
+        let chunks = vec![
+            chunk("potager.md", "Les tomates du jardin craignent la météo humide."),
+            chunk("infra.md", "Le serveur pbs1 conserve les archives ; restauration testée chaque mois."),
+            chunk("lan.md", "Le VLAN 20 isole les caméras derrière le pare-feu."),
+        ];
+        let conn = crate::embed::EmbedConn { base, key: String::new(), model: "faux-embed".into() };
+        let index = std::env::temp_dir().join(format!("md-emb-{}.emb", uuid::Uuid::new_v4().simple()));
+        let progress = |_: usize, _: usize| {};
+
+        // « backup » ne figure dans aucun extrait : seul le sens rapproche la question d'infra.md.
+        let order = crate::embed::rank(&index, &conn, &chunks, "Où sont les backup ?", &progress).await.unwrap();
+        assert_eq!(order[0], 1, "{order:?}");
+        let first_calls = seen.lock().unwrap().len();
+        assert_eq!(first_calls, 2); // les extraits en un lot, puis la question
+
+        // Second appel : les extraits viennent de l'index, seule la question est calculée.
+        let order = crate::embed::rank(&index, &conn, &chunks, "règles du pare-feu", &progress).await.unwrap();
+        assert_eq!(order[0], 2);
+        {
+            let calls = seen.lock().unwrap();
+            assert_eq!(calls.len(), first_calls + 1);
+            assert_eq!(calls.last().unwrap().1["input"].as_array().unwrap().len(), 1);
+        }
+
+        // Un extrait modifié est recalculé seul.
+        let mut changed = chunks;
+        changed[0] = chunk("potager.md", "Arrosage du jardin le matin.");
+        crate::embed::rank(&index, &conn, &changed, "jardin", &progress).await.unwrap();
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls[calls.len() - 2].1["input"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_file(&index);
+    }
+
+    #[tokio::test]
+    async fn embedding_errors_are_readable() {
+        let (base, _) = mock(|_, _| (200, json!({ "embeddings": [] }).to_string())).await;
+        let err = embed(&base, "", "qwen3:8b", &["x".into()]).await.unwrap_err();
+        assert!(err.contains("modèle d'embedding"), "{err}");
     }
 }

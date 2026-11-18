@@ -19,7 +19,14 @@ const marked = new Marked({
       } catch {
         html = escapeHtml(text);
       }
+      // HTML ou SVG : bouton d'aperçu (rendu isolé, voir preview.ts).
+      const head = text.trimStart().slice(0, 200).toLowerCase();
+      const kind =
+        language === "svg" || (["xml", "html", ""].includes(language) && head.startsWith("<svg"))
+          ? "svg"
+          : language === "html" || head.startsWith("<!doctype html") || head.startsWith("<html") ? "html" : "";
       return `<div class="code-block"><div class="code-head"><span>${escapeHtml(language || "code")}</span>` +
+        (kind ? `<button type="button" class="preview-code" data-kind="${kind}">Aperçu</button>` : "") +
         `<button type="button" class="copy-code">Copier</button></div>` +
         `<pre><code class="hljs">${html}</code></pre></div>`;
     },
@@ -35,6 +42,7 @@ export function renderMarkdown(src: string): string {
   return DOMPurify.sanitize(html, {
     FORBID_TAGS: ["style", "form", "input", "iframe", "img"],
     FORBID_ATTR: ["style"],
+    ADD_ATTR: ["data-kind"],
   });
 }
 

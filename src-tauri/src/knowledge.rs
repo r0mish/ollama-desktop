@@ -30,12 +30,23 @@ fn kchars(n: usize) -> String {
     if n < 1000 { format!("{n} car.") } else { format!("{} k car.", n / 1000) }
 }
 
+/// Extraits d'un projet, dans l'ordre des fichiers.
+pub fn chunks(p: &Project) -> Vec<crate::textsearch::Chunk> {
+    p.files.iter().flat_map(|f| chunk(&f.name, &f.text, CHUNK_SIZE)).collect()
+}
+
 /// Extraits les plus pertinents pour `query`, dans la limite de `budget` caractères.
-pub fn search(p: &Project, query: &str, budget: usize) -> String {
-    let chunks: Vec<_> = p.files.iter().flat_map(|f| chunk(&f.name, &f.text, CHUNK_SIZE)).collect();
+/// `semantic` : classement par le sens (embeddings), fusionné avec celui des mots-clés.
+pub fn search(p: &Project, query: &str, budget: usize, semantic: Option<&[usize]>) -> String {
+    let chunks = chunks(p);
+    let keyword: Vec<usize> = bm25_rank(&chunks, query, 40).into_iter().map(|(i, _)| i).collect();
+    let order = match semantic {
+        Some(sem) => crate::embed::fuse(&keyword, &sem[..sem.len().min(40)], 40),
+        None => keyword,
+    };
     let mut used = 0;
     let mut out = Vec::new();
-    for (i, _) in bm25_rank(&chunks, query, 40) {
+    for i in order {
         let c = &chunks[i];
         let len = c.text.chars().count();
         if used + len > budget && !out.is_empty() {
@@ -48,13 +59,13 @@ pub fn search(p: &Project, query: &str, budget: usize) -> String {
 }
 
 /// Contenu des fichiers de référence à joindre pour la question `query`.
-pub fn context(p: &Project, query: &str) -> ProjectContext {
+pub fn context(p: &Project, query: &str, semantic: Option<&[usize]>) -> ProjectContext {
     if total_chars(p) <= FULL_CONTEXT_CHARS {
         let text = p.files.iter().map(|f| format!("<fichier nom=\"{}\">\n{}\n</fichier>", f.name, f.text)).collect::<Vec<_>>().join("\n\n");
         return ProjectContext { mode: "full", text };
     }
     let list = p.files.iter().map(|f| format!("- {} ({})", f.name, kchars(f.text.chars().count()))).collect::<Vec<_>>().join("\n");
-    let found = search(p, query, EXCERPT_BUDGET);
+    let found = search(p, query, EXCERPT_BUDGET, semantic);
     let text = format!(
         "Les fichiers de référence sont trop volumineux pour être joints en entier :\n{list}\n\n{}\
          Utilise l'outil search_project_files pour chercher d'autres passages (plusieurs requêtes si besoin) avant de répondre.",
@@ -82,7 +93,7 @@ mod tests {
     #[test]
     fn small_projects_are_joined_whole_and_large_ones_searched() {
         let small = project(vec![("a.md", "Le mot de passe Wi-Fi invité change chaque mois.".into())]);
-        let c = context(&small, "wifi");
+        let c = context(&small, "wifi", None);
         assert_eq!(c.mode, "full");
         assert!(c.text.contains("<fichier nom=\"a.md\">"));
 
@@ -92,7 +103,7 @@ mod tests {
             ("infra.md", format!("{filler}\nLe serveur de sauvegarde pbs1 a l'adresse 10.0.0.42.\n{filler}")),
         ]);
         assert!(total_chars(&large) > FULL_CONTEXT_CHARS);
-        let c = context(&large, "Quelle est l'adresse du serveur de sauvegarde ?");
+        let c = context(&large, "Quelle est l'adresse du serveur de sauvegarde ?", None);
         assert_eq!(c.mode, "excerpts");
         assert!(c.text.contains("10.0.0.42"), "{}", &c.text[..500.min(c.text.len())]);
         assert!(c.text.chars().count() < EXCERPT_BUDGET + 2_000);

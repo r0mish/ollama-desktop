@@ -131,6 +131,21 @@
         </footer>
         <div id="drop-overlay" hidden>Déposez vos fichiers ici</div>
 
+        <aside id="preview-panel" class="side-panel" hidden>
+          <header class="git-head">
+            <strong id="preview-title"></strong>
+            <span class="spacer"></span>
+            <div class="seg" id="preview-tabs">
+              <button type="button" data-view="render" class="active">Aperçu</button>
+              <button type="button" data-view="source">Source</button>
+            </div>
+            <button type="button" class="btn-ghost sm" id="preview-copy">Copier</button>
+            <button type="button" class="icon-btn sm" id="preview-close" title="Fermer">×</button>
+          </header>
+          <p class="muted small" id="preview-note" hidden>Rendu isolé : les scripts et les ressources distantes (images, polices) sont désactivés.</p>
+          <div id="preview-body"></div>
+        </aside>
+
         <aside id="changes-panel" class="side-panel" hidden>
           <header class="git-head">
             <strong>Fichiers modifiés</strong>
@@ -344,8 +359,19 @@
             <p class="muted small">Ollama ne transcrit pas l'audio : indiquez un serveur auto-hébergé compatible <code>/v1/audio/transcriptions</code> (<a href="https://speaches.ai" data-external>Speaches</a>/faster-whisper, whisper.cpp <code>server</code>, Voxtral via vLLM…). Le son est capté en mémoire uniquement, jamais écrit sur le disque.</p>
           </fieldset>
           <fieldset>
+            <legend>Recherche dans les projets</legend>
+            <label>Modèle d'embedding (recherche par le sens)
+              <input id="s-embed" list="embed-models" placeholder="vide = recherche par mots-clés uniquement" spellcheck="false" />
+              <datalist id="embed-models"></datalist>
+            </label>
+            <p class="muted small">Pour les gros projets (plus de 60 000 caractères de fichiers de référence), seuls les passages utiles sont envoyés au modèle. Avec un modèle d'embedding installé sur votre serveur Ollama (<code>bge-m3</code>, multilingue ; <code>nomic-embed-text</code>, <code>embeddinggemma</code>), la recherche comprend aussi les synonymes et les reformulations, en plus des mots-clés. L'index est calculé une fois par votre serveur et gardé chiffré sur cet appareil.</p>
+          </fieldset>
+          <fieldset>
             <legend>Documents PDF</legend>
-            <p class="muted small">Le texte des PDF est extrait localement, rien n'est envoyé ailleurs qu'à votre serveur Ollama. Pour un PDF scanné, joignez des captures des pages à un modèle vision.</p>
+            <label>Modèle vision pour les PDF scannés
+              <select id="s-ocr"></select>
+            </label>
+            <p class="muted small">Le texte des PDF est extrait localement. Un PDF scanné (sans texte) est lu page par page par le modèle vision choisi, sur votre serveur Ollama : comptez quelques secondes par page.</p>
           </fieldset>
         </div>
 

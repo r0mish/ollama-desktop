@@ -1045,3 +1045,26 @@ details.tool > summary:hover { background: var(--bg-hover); }
 .chg-step { padding: 6px 12px 2px; }
 .changes-btn svg { color: #d29922; }
 #topbar > .changes-btn { min-width: 0; flex-shrink: 0; }
+
+/* ---------------------------------------------------------------- aperçu, pièces jointes, citations */
+#preview-panel { width: min(640px, 100%); }
+#preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+#preview-note { margin: 0; padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--bg); }
+#preview-body { flex: 1; overflow: auto; min-height: 0; display: flex; flex-direction: column; }
+.preview-frame { flex: 1; width: 100%; border: none; background: #fff; min-height: 300px; }
+.preview-svg { padding: 16px; display: flex; align-items: center; justify-content: center; background: #fff; flex: 1; }
+.preview-svg svg { width: 100%; max-width: 560px; height: auto; }
+.preview-image { padding: 12px; display: grid; place-items: center; flex: 1; }
+.preview-image img { max-width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+.preview-text { margin: 0; padding: 12px 14px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.seg { display: flex; gap: 2px; padding: 2px; background: var(--bg-hover); border-radius: 8px; }
+.seg button { border: none; background: transparent; padding: 2px 10px; border-radius: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.seg button.active { background: var(--bg-elev); color: var(--text); box-shadow: var(--shadow); }
+.preview-code { border: none; background: transparent; color: #7ee0d2; font-size: 12px; padding: 2px 8px; border-radius: 6px; margin-left: auto; cursor: pointer; }
+.preview-code:hover { background: rgba(255, 255, 255, 0.1); }
+.code-head .preview-code + .copy-code { margin-left: 0; }
+.msg-attachments img, .att[data-show], button.chip { cursor: pointer; }
+button.chip { font: inherit; color: var(--text); }
+button.chip:hover { border-color: var(--accent); }
+code.cite { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+code.cite:hover { color: var(--accent); }
