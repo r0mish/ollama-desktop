@@ -32,6 +32,10 @@
         </div>
         <nav id="conv-list"></nav>
         <div class="sidebar-bottom">
+          <button type="button" id="server-chip" class="server-chip" data-state="connecting">
+            <i class="sc-dot"></i><span class="sc-text"><strong class="sc-name">Ollama</strong><small class="sc-detail">connexion…</small></span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg>
+          </button>
           <button id="open-settings" class="btn-ghost" title="Réglages (Ctrl+,)">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
             Réglages
@@ -154,7 +158,7 @@
     </div>
 
     <dialog id="settings">
-      <form id="settings-form" method="dialog">
+      <form id="settings-form" method="dialog" novalidate>
         <div class="settings-head">
           <h2>Réglages</h2>
           <nav class="settings-tabs">
@@ -168,23 +172,51 @@
 
         <div class="tab" data-tab="general">
           <fieldset>
-            <legend>Serveur Ollama</legend>
+            <legend>Serveurs Ollama</legend>
+            <div id="srv-list"></div>
             <div class="row">
-              <input id="s-base" type="url" placeholder="http://localhost:11434" spellcheck="false" />
-              <button type="button" id="test-server" class="btn-ghost">Tester</button>
+              <button type="button" id="srv-add" class="btn-ghost sm">+ Ajouter un serveur</button>
+              <span class="spacer"></span>
+              <button type="button" id="test-server" class="btn-ghost sm">Tester le serveur choisi</button>
             </div>
             <p class="muted small" id="server-status"></p>
-            <p class="muted small">Local (<code>localhost</code>), machine du réseau privé (<code>http://192.168.1.20:11434</code>, <code>http://gpu.lan:11434</code>, Tailscale…) ou serveur distant en HTTPS. Sur une autre machine, lancez Ollama avec <code>OLLAMA_HOST=0.0.0.0</code> et filtrez le port 11434 au pare-feu.</p>
-            <details>
-              <summary class="small">Clé API (facultatif : Ollama derrière un proxy authentifiant)</summary>
-              <p class="muted small" id="key-status"></p>
-              <div class="row">
-                <input id="api-key" type="password" placeholder="Jeton envoyé en en-tête Authorization: Bearer" autocomplete="off" spellcheck="false" />
-                <button type="button" id="save-key" class="btn-primary">Enregistrer</button>
-                <button type="button" id="delete-key" class="btn-ghost danger">Supprimer</button>
+            <div id="srv-form" hidden>
+              <div class="grid2">
+                <label>Nom <input id="srv-name" placeholder="Ex. : PC fixe, Serveur GPU" maxlength="40" /></label>
+                <label>Connexion
+                  <select id="srv-kind">
+                    <option value="direct">Adresse directe</option>
+                    <option value="ssh">Tunnel SSH</option>
+                  </select>
+                </label>
               </div>
-              <p class="muted small">Stockée dans le trousseau du système (Keychain, Credential Manager, Secret Service), jamais en clair sur le disque. Repli : variable <code>OLLAMA_API_KEY</code>.</p>
-            </details>
+              <div id="srv-direct">
+                <label>Adresse <input id="srv-url" type="url" placeholder="http://localhost:11434" spellcheck="false" /></label>
+                <p class="muted small">Local (<code>localhost</code>), réseau privé (<code>http://192.168.1.20:11434</code>, <code>http://gpu.lan:11434</code>, Tailscale…) ou distant en HTTPS. Sur une autre machine, Ollama doit écouter sur le réseau (<code>OLLAMA_HOST=0.0.0.0</code>) : préférez un tunnel SSH pour ne pas exposer le port.</p>
+              </div>
+              <div id="srv-tunnel" hidden>
+                <div class="grid2">
+                  <label>Serveur SSH <select id="srv-ssh"></select></label>
+                  <label>Port d'Ollama sur le serveur <input id="srv-port" type="number" min="1" max="65535" placeholder="11434" /></label>
+                </div>
+                <p class="muted small">Ollama reste en écoute sur <code>127.0.0.1</code> côté serveur : rien n'est exposé au réseau, tout passe par SSH (chiffré, avec vos clés).
+                  <button type="button" class="btn-ghost sm" id="srv-open-ssh">Serveurs SSH…</button></p>
+              </div>
+              <details>
+                <summary class="small">Clé API (facultatif : Ollama derrière un proxy authentifiant)</summary>
+                <p class="muted small" id="key-status"></p>
+                <div class="row">
+                  <input id="api-key" type="password" placeholder="Jeton envoyé en en-tête Authorization: Bearer" autocomplete="off" spellcheck="false" />
+                  <button type="button" id="save-key" class="btn-primary sm">Enregistrer</button>
+                  <button type="button" id="delete-key" class="btn-ghost sm danger">Supprimer</button>
+                </div>
+                <p class="muted small">Stockée dans le trousseau du système, jamais en clair sur le disque. Repli : variable <code>OLLAMA_API_KEY</code>.</p>
+              </details>
+              <div class="row end">
+                <button type="button" id="srv-cancel" class="btn-ghost sm">Annuler</button>
+                <button type="button" id="srv-ok" class="btn-primary sm">Valider</button>
+              </div>
+            </div>
           </fieldset>
 
           <fieldset>
@@ -481,6 +513,51 @@
         <div id="md-progress" hidden></div>
         <div id="md-suggest"></div>
         <p class="muted small">Catalogue complet : <a href="https://ollama.com/library" data-external>ollama.com/library</a>. Taille indicative en Q4 : ≈ 0,6 Go par milliard de paramètres, plus la mémoire du contexte. Un téléchargement interrompu reprend là où il s'est arrêté.</p>
+      </div>
+    </dialog>
+
+    <dialog id="assistants-dialog">
+      <div class="ssh-layout">
+        <aside class="ssh-hosts">
+          <div class="group">Assistants</div>
+          <div id="as-list"></div>
+          <button type="button" class="btn-ghost sm" id="as-new">+ Nouvel assistant</button>
+        </aside>
+        <section class="ssh-main">
+          <div class="settings-head">
+            <h2 id="as-title">Nouvel assistant</h2>
+            <button type="button" class="icon-btn" id="as-close" title="Fermer">×</button>
+          </div>
+          <form id="as-form" autocomplete="off">
+            <div class="grid2">
+              <label>Nom <input id="as-name" maxlength="40" placeholder="Ex. : Relecteur, Admin Linux" /></label>
+              <label>Modèle <select id="as-model"></select></label>
+            </div>
+            <label>Description (facultatif) <input id="as-desc" maxlength="120" placeholder="Ex. : corrige et reformule mes textes en français" /></label>
+            <label>Instructions système
+              <textarea id="as-system" rows="6" placeholder="Ex. : Tu es administrateur système Linux. Réponds en français, avec des commandes prêtes à copier et les risques éventuels."></textarea>
+            </label>
+            <div class="grid3">
+              <label>Température <input id="as-temp" type="number" min="0" max="2" step="0.1" placeholder="globale" /></label>
+              <label>Contexte
+                <select id="as-ctx">
+                  <option value="">Global</option>
+                  <option value="4096">4 k</option><option value="8192">8 k</option><option value="16384">16 k</option>
+                  <option value="32768">32 k</option><option value="65536">64 k</option><option value="131072">128 k</option>
+                </select>
+              </label>
+              <label>Raisonnement
+                <select id="as-think"><option value="">Global</option><option value="on">Activé</option><option value="off">Désactivé</option></select>
+              </label>
+            </div>
+            <p class="muted small">Un assistant préremplit le modèle, les consignes et les réglages d'une conversation. Stocké uniquement sur cet appareil.</p>
+            <div class="row end">
+              <button type="button" class="btn-ghost sm danger" id="as-delete" hidden>Supprimer</button>
+              <button type="submit" class="btn-ghost sm">Enregistrer</button>
+              <button type="button" class="btn-primary sm" id="as-use" hidden>Utiliser</button>
+            </div>
+          </form>
+        </section>
       </div>
     </dialog>
 

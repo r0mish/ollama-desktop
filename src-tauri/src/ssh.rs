@@ -181,8 +181,38 @@ fn auth_methods(stderr: &str) -> Vec<String> {
 
 const AUTH_PREFIX: &str = "AUTH[";
 
+/// Retire les préfixes internes (`HOSTKEY:`, `AUTH[…]:`) d'un message destiné à l'utilisateur.
+pub fn clean_error(e: &str) -> String {
+    let e = e.trim_start_matches("HOSTKEY:").trim();
+    match e.strip_prefix(AUTH_PREFIX).and_then(|rest| rest.split_once("]: ")) {
+        Some((_, msg)) => msg.to_string(),
+        None => e.to_string(),
+    }
+}
+
+/// Redirection du port local `local` vers `remote` sur l'hôte (127.0.0.1 des deux côtés).
+pub fn tunnel_command(h: &SshHost, local: u16, remote: u16) -> R<tokio::process::Command> {
+    validate(h)?;
+    let mut cmd = tokio::process::Command::new(exe("ssh"));
+    cmd.args(["-N", "-T"]).args(common_args(h)).args([
+        "-o",
+        "ExitOnForwardFailure=yes",
+        // Connexion dédiée : le tunnel ne dépend pas d'une connexion partagée (ControlMaster).
+        "-o",
+        "ControlPath=none",
+        "-L",
+        &format!("127.0.0.1:{local}:127.0.0.1:{remote}"),
+        "--",
+        &h.host,
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.kill_on_drop(true);
+    Ok(cmd)
+}
+
 /// Traduit les erreurs de connexion d'OpenSSH en messages clairs.
-fn connection_error(stderr: &str) -> Option<String> {
+pub fn connection_error(stderr: &str) -> Option<String> {
     let s = stderr.to_lowercase();
     if s.contains("permission denied") {
         // Préfixe lu par `test` pour proposer l'installation d'une clé.

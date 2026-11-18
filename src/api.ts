@@ -1,8 +1,9 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 export interface Settings {
-  /** Serveur Ollama (local, réseau privé, ou distant en HTTPS). */
-  baseUrl: string;
+  /** Serveurs Ollama et identifiant de celui utilisé. */
+  servers: Server[];
+  activeServer: string;
   /** Vide = premier modèle installé. */
   defaultModel: string;
   systemPrompt: string;
@@ -64,8 +65,21 @@ export interface RunningModel {
   contextLength: number | null;
 }
 
-export interface ServerStatus {
+/** Un serveur Ollama : adresse directe, ou tunnel SSH vers un serveur SSH enregistré. */
+export interface Server {
+  id: string;
+  name: string;
   url: string;
+  sshHost: string | null;
+  remotePort: number | null;
+}
+
+export interface ServerStatus {
+  id: string;
+  name: string;
+  url: string;
+  /** Nom du serveur SSH quand la connexion passe par un tunnel. */
+  tunnel: string | null;
   version: string | null;
   error: string | null;
   /** HTTP en clair hors de cette machine. */
@@ -112,6 +126,16 @@ export interface Message {
   toolCalls?: ToolCallRec[];
   /** Relance envoyée automatiquement par l'application. */
   auto?: boolean;
+  /** Réponse d'un second modèle à la même question, affichée côte à côte. */
+  alt?: AltAnswer;
+}
+
+export interface AltAnswer {
+  model: string;
+  content: string;
+  reasoning?: string;
+  usage?: { promptTokens: number; completionTokens: number; tokensPerSec?: number | null };
+  error?: string;
 }
 
 export interface Compaction {
@@ -133,6 +157,16 @@ export interface ConvParams {
   think?: boolean | null;
 }
 
+/** Assistant personnalisé : un modèle, des consignes et des réglages réutilisables. */
+export interface Assistant {
+  id: string;
+  name: string;
+  description: string;
+  model: string;
+  systemPrompt: string;
+  params?: ConvParams;
+}
+
 export type Kind = "chat" | "code";
 export type PermissionMode = "ask" | "acceptEdits" | "auto";
 
@@ -145,6 +179,8 @@ export interface Conversation {
   updatedAt: number;
   systemPrompt: string | null;
   params?: ConvParams;
+  /** Nom de l'assistant appliqué, pour l'affichage. */
+  assistant?: string;
   messages: Message[];
   workspace?: string;
   permissionMode?: PermissionMode;
@@ -327,9 +363,11 @@ export interface GitCommit {
 export type UsageLog = Record<string, Record<string, [number, number, number]>>;
 
 export const api = {
-  keyStatus: () => invoke<KeyStatus>("api_key_status"),
-  setKey: (key: string) => invoke<void>("set_api_key", { key }),
-  deleteKey: () => invoke<void>("delete_api_key"),
+  keyStatus: (server: string) => invoke<KeyStatus>("api_key_status", { server }),
+  setKey: (server: string, key: string) => invoke<void>("set_api_key", { server, key }),
+  deleteKey: (server: string) => invoke<void>("delete_api_key", { server }),
+  listAssistants: () => invoke<Assistant[]>("list_assistants"),
+  saveAssistants: (assistants: Assistant[]) => invoke<void>("save_assistants", { assistants }),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
   serverStatus: () => invoke<ServerStatus>("server_status"),

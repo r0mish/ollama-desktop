@@ -9,6 +9,7 @@ mod knowledge;
 mod target;
 mod textsearch;
 mod tools;
+mod tunnel;
 mod updates;
 mod vault;
 mod web;
@@ -41,14 +42,16 @@ struct Streams(Mutex<HashMap<String, Arc<Notify>>>);
 
 type CmdResult<T> = Result<T, String>;
 
-fn keyring_entry() -> CmdResult<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.to_string())
+/// Entrée du trousseau pour la clé API d'un serveur Ollama.
+fn keyring_entry(server: &str) -> CmdResult<keyring::Entry> {
+    let user = if server.is_empty() || server == "default" { KEYRING_USER.to_string() } else { format!("{KEYRING_USER}:{server}") };
+    keyring::Entry::new(KEYRING_SERVICE, &user).map_err(|e| e.to_string())
 }
 
 /// Clé API facultative (Ollama derrière un proxy authentifiant, ollama.com) : trousseau du
 /// système d'abord, variable d'environnement en repli. Vide = aucune authentification.
-fn api_key() -> String {
-    if let Ok(key) = keyring_entry().and_then(|e| e.get_password().map_err(|e| e.to_string())) {
+fn api_key(server: &str) -> String {
+    if let Ok(key) = keyring_entry(server).and_then(|e| e.get_password().map_err(|e| e.to_string())) {
         if !key.is_empty() {
             return key;
         }
@@ -56,9 +59,27 @@ fn api_key() -> String {
     std::env::var(ENV_API_KEY).unwrap_or_default()
 }
 
-/// URL du serveur et clé API.
-fn server(app: &AppHandle) -> CmdResult<(Settings, String)> {
-    Ok((storage::load_settings(app)?, api_key()))
+/// Connexion au serveur Ollama actif : adresse (celle du tunnel SSH le cas échéant) et clé API.
+struct Conn {
+    settings: Settings,
+    server: storage::Server,
+    base: String,
+    key: String,
+}
+
+async fn conn(app: &AppHandle, tunnels: &tunnel::Tunnels) -> CmdResult<Conn> {
+    let settings = storage::load_settings(app)?;
+    let server = settings.active();
+    let base = match &server.ssh_host {
+        Some(host_id) => {
+            let host = find_host(app, host_id).map_err(|_| format!("Le serveur SSH du tunnel « {} » n'existe plus : corrigez-le dans les réglages.", server.name))?;
+            let port = tunnels.ensure(&server.id, &host, server.remote_port.unwrap_or(11434)).await?;
+            format!("http://127.0.0.1:{port}")
+        }
+        None => server.url.trim().to_string(),
+    };
+    let key = api_key(&server.id);
+    Ok(Conn { settings, server, base, key })
 }
 
 #[derive(serde::Serialize)]
@@ -69,8 +90,8 @@ struct KeyStatus {
 }
 
 #[tauri::command]
-fn api_key_status() -> KeyStatus {
-    let in_keyring = keyring_entry()
+fn api_key_status(server: String) -> KeyStatus {
+    let in_keyring = keyring_entry(&server)
         .and_then(|e| e.get_password().map_err(|e| e.to_string()))
         .map(|k| !k.is_empty())
         .unwrap_or(false);
@@ -84,19 +105,19 @@ fn api_key_status() -> KeyStatus {
 }
 
 #[tauri::command]
-fn set_api_key(key: String) -> CmdResult<()> {
+fn set_api_key(server: String, key: String) -> CmdResult<()> {
     let key = key.trim();
     if key.is_empty() {
         return Err("Clé vide".into());
     }
-    keyring_entry()?
+    keyring_entry(&server)?
         .set_password(key)
         .map_err(|e| format!("Impossible d'écrire dans le trousseau du système : {e}"))
 }
 
 #[tauri::command]
-fn delete_api_key() -> CmdResult<()> {
-    match keyring_entry()?.delete_credential() {
+fn delete_api_key(server: String) -> CmdResult<()> {
+    match keyring_entry(&server)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -108,8 +129,17 @@ fn get_settings(app: AppHandle) -> CmdResult<Settings> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<()> {
-    ollama::validate_base_url(settings.base_url.trim())?;
+async fn save_settings(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, settings: Settings) -> CmdResult<()> {
+    if settings.servers.is_empty() {
+        return Err("Au moins un serveur Ollama est nécessaire".into());
+    }
+    for v in &settings.servers {
+        if v.ssh_host.is_none() {
+            ollama::validate_base_url(v.url.trim()).map_err(|e| format!("Serveur « {} » : {e}", v.name))?;
+        }
+    }
+    // Les tunnels des serveurs inactifs sont fermés ; celui du serveur actif est rouvert au besoin.
+    tunnels.close_except(Some(&settings.active().id)).await;
     if !settings.transcription_url.trim().is_empty() {
         ollama::validate_base_url(settings.transcription_url.trim())?;
     }
@@ -165,7 +195,13 @@ fn vault_import_key(app: AppHandle, key: String) -> CmdResult<()> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OllamaStatus {
+    /// Identifiant et nom du serveur actif.
+    id: String,
+    name: String,
+    /// Adresse affichée (celle du serveur, pas le port local d'un tunnel).
     url: String,
+    /// Nom du serveur SSH quand la connexion passe par un tunnel.
+    tunnel: Option<String>,
     version: Option<String>,
     error: Option<String>,
     /// HTTP en clair hors de cette machine : la clé API éventuelle transite sans chiffrement.
@@ -173,59 +209,87 @@ struct OllamaStatus {
 }
 
 #[tauri::command]
-async fn server_status(app: AppHandle) -> CmdResult<OllamaStatus> {
-    let (s, key) = server(&app)?;
-    let insecure = s.base_url.trim().starts_with("http://") && !ollama::is_loopback(&s.base_url);
-    let (version, error) = match ollama::version(&s.base_url, &key).await {
-        Ok(v) => (Some(v), None),
+async fn server_status(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<OllamaStatus> {
+    let settings = storage::load_settings(&app)?;
+    let server = settings.active();
+    let tunnel = server.ssh_host.as_deref().map(|id| find_host(&app, id).map(|h| h.label).unwrap_or_else(|_| "serveur SSH supprimé".into()));
+    let url = match &tunnel {
+        Some(label) => format!("{label} · tunnel SSH vers le port {}", server.remote_port.unwrap_or(11434)),
+        None => server.url.trim().to_string(),
+    };
+    let insecure = tunnel.is_none() && url.starts_with("http://") && !ollama::is_loopback(&url);
+    let (version, error) = match conn(&app, &tunnels).await {
+        Ok(c) => match ollama::version(&c.base, &c.key).await {
+            Ok(v) => (Some(v), None),
+            // Derrière un tunnel, l'adresse locale n'aide pas : on nomme le serveur.
+            Err(e) if tunnel.is_some() => (None, Some(format!("Tunnel SSH ouvert, mais Ollama ne répond pas sur le port {} du serveur ({e})", c.server.remote_port.unwrap_or(11434)))),
+            Err(e) => (None, Some(e)),
+        },
         Err(e) => (None, Some(e)),
     };
-    Ok(OllamaStatus { url: s.base_url, version, error, insecure })
+    Ok(OllamaStatus { id: server.id, name: server.name, url, tunnel, version, error, insecure })
 }
 
 #[tauri::command]
-async fn list_models(app: AppHandle) -> CmdResult<Vec<ModelInfo>> {
-    let (s, key) = server(&app)?;
-    ollama::list_models(&s.base_url, &key).await
+async fn list_models(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<Vec<ModelInfo>> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::list_models(&c.base, &c.key).await
 }
 
 #[tauri::command]
-async fn running_models(app: AppHandle) -> CmdResult<Vec<RunningModel>> {
-    let (s, key) = server(&app)?;
-    ollama::running_models(&s.base_url, &key).await
+async fn running_models(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>) -> CmdResult<Vec<RunningModel>> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::running_models(&c.base, &c.key).await
 }
 
 /// Télécharge un modèle ; renvoie false si l'utilisateur a annulé.
 #[tauri::command]
-async fn pull_model(app: AppHandle, streams: State<'_, Streams>, request_id: String, model: String, on_progress: Channel<PullProgress>) -> CmdResult<bool> {
+async fn pull_model(
+    app: AppHandle,
+    streams: State<'_, Streams>,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
+    request_id: String,
+    model: String,
+    on_progress: Channel<PullProgress>,
+) -> CmdResult<bool> {
     let model = model.trim().to_string();
     if model.is_empty() || model.chars().any(|c| c.is_whitespace()) {
         return Err("Nom de modèle invalide (ex. qwen3:8b)".into());
     }
-    let (s, key) = server(&app)?;
+    let c = conn(&app, &tunnels).await?;
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let res = ollama::pull_model(&s.base_url, &key, &model, &on_progress, cancel).await;
+    let res = ollama::pull_model(&c.base, &c.key, &model, &on_progress, cancel).await;
     streams.0.lock().unwrap().remove(&request_id);
     res
 }
 
 #[tauri::command]
-async fn delete_model(app: AppHandle, model: String) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::delete_model(&s.base_url, &key, &model).await
+async fn delete_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::delete_model(&c.base, &c.key, &model).await
 }
 
 #[tauri::command]
-async fn unload_model(app: AppHandle, model: String) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::unload_model(&s.base_url, &key, &model).await
+async fn unload_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::unload_model(&c.base, &c.key, &model).await
 }
 
 #[tauri::command]
-async fn preload_model(app: AppHandle, model: String, num_ctx: Option<u32>) -> CmdResult<()> {
-    let (s, key) = server(&app)?;
-    ollama::preload_model(&s.base_url, &key, &model, &s.keep_alive, num_ctx).await
+async fn preload_model(app: AppHandle, tunnels: State<'_, Arc<tunnel::Tunnels>>, model: String, num_ctx: Option<u32>) -> CmdResult<()> {
+    let c = conn(&app, &tunnels).await?;
+    ollama::preload_model(&c.base, &c.key, &model, &c.settings.keep_alive, num_ctx).await
+}
+
+#[tauri::command]
+fn list_assistants(app: AppHandle) -> Vec<serde_json::Value> {
+    storage::load_assistants(&app)
+}
+
+#[tauri::command]
+fn save_assistants(app: AppHandle, assistants: Vec<serde_json::Value>) -> CmdResult<()> {
+    storage::save_assistants(&app, &assistants)
 }
 
 #[tauri::command]
@@ -269,14 +333,15 @@ fn data_dir(app: AppHandle) -> CmdResult<String> {
 async fn chat_stream(
     app: AppHandle,
     streams: State<'_, Streams>,
+    tunnels: State<'_, Arc<tunnel::Tunnels>>,
     request_id: String,
     request: ChatRequest,
     on_event: Channel<StreamEvent>,
 ) -> CmdResult<()> {
-    let (settings, key) = server(&app)?;
+    let c = conn(&app, &tunnels).await?;
     let cancel = Arc::new(Notify::new());
     streams.0.lock().unwrap().insert(request_id.clone(), cancel.clone());
-    let result = ollama::chat_stream(&settings.base_url, &key, &settings.keep_alive, request, &on_event, cancel).await;
+    let result = ollama::chat_stream(&c.base, &c.key, &c.settings.keep_alive, request, &on_event, cancel).await;
     streams.0.lock().unwrap().remove(&request_id);
     result
 }
@@ -755,6 +820,7 @@ pub fn run() {
         .manage(Streams::default())
         .manage(Dictation::default())
         .manage(Arc::new(McpManager::default()))
+        .manage(Arc::new(tunnel::Tunnels::default()))
         .setup(|app| {
             // Chiffrement des données locales : activé avant tout accès aux conversations,
             // puis conversion des fichiers existants (synchrone, pour éviter toute course).
@@ -778,6 +844,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             api_key_status,
             server_status,
+            list_assistants,
+            save_assistants,
             running_models,
             pull_model,
             delete_model,
@@ -856,6 +924,8 @@ pub fn run() {
             // Arrêt propre des serveurs MCP (processus enfants).
             let mgr = handle.state::<Arc<McpManager>>().inner().clone();
             tauri::async_runtime::block_on(mgr.shutdown());
+            let tunnels = handle.state::<Arc<tunnel::Tunnels>>().inner().clone();
+            tauri::async_runtime::block_on(tunnels.close_except(None));
         }
     });
 }

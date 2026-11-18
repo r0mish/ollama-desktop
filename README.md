@@ -10,10 +10,13 @@ Tout s'exécute sur **votre** serveur Ollama (ce PC, une machine du LAN, un serv
 
 ## Fonctionnalités
 
-### Serveur Ollama
-- **Local** (`http://localhost:11434`, par défaut), **réseau privé** (`http://192.168.1.20:11434`, `http://gpu.lan:11434`, Tailscale…) ou **distant en HTTPS**. HTTP en clair refusé vers Internet
-- Écran d'accueil si Ollama est injoignable (installation, `ollama serve`), reconnexion automatique dès qu'il démarre
-- **Clé API facultative** (Ollama derrière un reverse proxy authentifiant : Caddy, Nginx, Traefik…), envoyée en `Authorization: Bearer`, stockée dans le trousseau du système
+### Serveurs Ollama
+- **Plusieurs serveurs**, avec bascule en un clic depuis l'indicateur de la barre latérale (ou la palette) : ce PC, une machine du LAN, un serveur GPU…
+- **Adresse directe** : locale (`http://localhost:11434`, par défaut), réseau privé (`http://192.168.1.20:11434`, `http://gpu.lan:11434`, Tailscale…) ou distante en HTTPS. HTTP en clair refusé vers Internet
+- **Tunnel SSH** : l'application ouvre `ssh -N -L` vers un serveur SSH enregistré et parle à Ollama à travers. Ollama reste en écoute sur `127.0.0.1` côté serveur : aucun port à exposer, tout est chiffré et authentifié par vos clés SSH. Le tunnel est ouvert à la demande et rétabli s'il tombe
+- **Indicateur permanent** (bas de la barre latérale) : serveur actif, état de la connexion, modèles en mémoire et leur taille ; menu pour décharger un modèle ou changer de serveur
+- Accueil guidé si Ollama est injoignable, reconnexion automatique dès qu'il démarre
+- **Clé API facultative par serveur** (Ollama derrière un reverse proxy authentifiant : Caddy, Nginx, Traefik…), envoyée en `Authorization: Bearer`, stockée dans le trousseau du système
 - API **native** d'Ollama (`/api/chat`) : `num_ctx`, `keep_alive`, raisonnement (`think`), images, appels d'outils
 
 ### Gestionnaire de modèles (`Ctrl/⌘+M`)
@@ -31,6 +34,8 @@ Tout s'exécute sur **votre** serveur Ollama (ce PC, une machine du LAN, un serv
 - **Sélecteur de modèle** avec recherche, capacités (outils, vision, raisonnement), taille et modèles déjà en mémoire
 - **Réglages par conversation** (bouton curseurs) : instructions système, température, fenêtre de contexte, raisonnement
 - **Palette de commandes** (`Ctrl/⌘+K`) : actions, conversations (titres et contenu), modèles et projets au clavier
+- **Assistants** : un modèle, des consignes et des réglages enregistrés sous un nom (« Relecteur », « Admin Linux »…), proposés à l'accueil, dans le sélecteur de modèle et la palette
+- **Comparaison de modèles** : bouton « Comparer » sous une réponse pour poser la même question à un second modèle et afficher les deux réponses côte à côte ; « Garder » retient celle que vous préférez
 - **Accueil guidé** au premier lancement : connexion au serveur, premier modèle, prise en main
 - Réponses en **streaming**, arrêt à tout moment (bouton ■ ou `Échap`), **vitesse de génération** (tok/s) affichée
 - **Raisonnement** (qwen3, magistral, deepseek-r1, gpt-oss…) dans un bloc repliable, désactivable
@@ -121,7 +126,9 @@ sudo systemctl restart ollama
 sudo ufw allow from 192.168.1.0/24 to any port 11434 proto tcp
 ```
 
-Puis Réglages → Serveur Ollama : `http://ip-du-serveur:11434` → **Tester**. Hors du LAN, préférez un VPN (WireGuard, Tailscale/Headscale) ou un reverse proxy HTTPS avec authentification.
+Puis Réglages → Serveurs Ollama → Ajouter un serveur : `http://ip-du-serveur:11434` → **Tester**.
+
+Plus simple et plus sûr si vous avez un accès SSH au serveur : choisissez **Tunnel SSH** au lieu d'une adresse. Rien à changer côté serveur (Ollama garde son écoute par défaut sur `127.0.0.1`), aucun port à ouvrir au pare-feu. Hors du LAN sans SSH, préférez un VPN (WireGuard, Tailscale/Headscale) ou un reverse proxy HTTPS avec authentification.
 
 Emplacements locaux :
 
@@ -182,6 +189,8 @@ cd src-tauri && cargo test   # tests, dont le client Ollama contre un faux serve
 src/                    Interface (TypeScript, sans framework)
   main.ts               État, rendu, boucle d'agent (une exécution par conversation), pièces jointes, réglages
   model-picker.ts       Sélecteur de modèle
+  servers-ui.ts         Serveurs Ollama (réglages, indicateur de la barre latérale)
+  assistants-ui.ts      Assistants personnalisés
   conv-settings.ts      Réglages par conversation
   palette.ts            Palette de commandes
   popover.ts            Panneaux flottants
@@ -194,6 +203,7 @@ src/                    Interface (TypeScript, sans framework)
   ssh-ui.ts, git-ui.ts  Serveurs SSH, panneau Git
 src-tauri/src/
   lib.rs                Commandes Tauri, trousseau, annulation, PDF
+  tunnel.rs             Tunnels SSH vers un Ollama distant
   ollama.rs             Client Ollama : chat NDJSON (outils, raisonnement), modèles, pull, transcription
   tools.rs              Registre des outils et exécution
   workspace.rs          Outils de code confinés au dossier de projet

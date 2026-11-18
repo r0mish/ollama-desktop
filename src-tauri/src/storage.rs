@@ -12,11 +12,28 @@ use tauri_plugin_dialog::DialogExt;
 
 type R<T> = Result<T, String>;
 
+/// Un serveur Ollama : adresse directe, ou tunnel SSH vers un serveur enregistré.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Server {
+    pub id: String,
+    pub name: String,
+    /// Adresse directe (local, réseau privé, ou distant en HTTPS). Ignorée avec un tunnel SSH.
+    pub url: String,
+    /// Tunnel SSH : identifiant d'un serveur SSH enregistré.
+    pub ssh_host: Option<String>,
+    /// Port d'Ollama sur le serveur SSH (11434 par défaut).
+    pub remote_port: Option<u16>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Serveur Ollama (local, réseau privé, ou distant en HTTPS).
+    /// Ancien réglage (versions < 0.4) : repris comme premier serveur à la migration.
     pub base_url: String,
+    /// Serveurs Ollama et identifiant de celui utilisé.
+    pub servers: Vec<Server>,
+    pub active_server: String,
     /// Modèle par défaut (vide = premier modèle installé).
     pub default_model: String,
     pub system_prompt: String,
@@ -71,10 +88,28 @@ const SETTINGS_VERSION: u32 = 1;
 
 /// Mises à niveau des réglages d'anciennes versions.
 fn migrate_settings(s: &mut Settings) {
+    if s.servers.is_empty() {
+        // < 0.4 : une seule adresse de serveur.
+        let url = if s.base_url.trim().is_empty() { crate::ollama::DEFAULT_BASE_URL.to_string() } else { s.base_url.trim().to_string() };
+        s.servers = vec![Server { id: "default".into(), name: "Ollama".into(), url, ..Default::default() }];
+    }
+    if !s.servers.iter().any(|v| v.id == s.active_server) {
+        s.active_server = s.servers[0].id.clone();
+    }
     s.settings_version = SETTINGS_VERSION;
 }
 
 impl Settings {
+    /// Serveur Ollama utilisé.
+    pub fn active(&self) -> Server {
+        self.servers
+            .iter()
+            .find(|v| v.id == self.active_server)
+            .or_else(|| self.servers.first())
+            .cloned()
+            .unwrap_or_else(|| Server { id: "default".into(), name: "Ollama".into(), url: crate::ollama::DEFAULT_BASE_URL.into(), ..Default::default() })
+    }
+
     pub fn vocabulary(&self) -> Vec<String> {
         self.transcription_vocabulary
             .split([',', '\n', ';'])
@@ -89,6 +124,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             base_url: crate::ollama::DEFAULT_BASE_URL.into(),
+            servers: vec![Server { id: "default".into(), name: "Ollama".into(), url: crate::ollama::DEFAULT_BASE_URL.into(), ..Default::default() }],
+            active_server: "default".into(),
             default_model: String::new(),
             system_prompt: String::new(),
             temperature: None,
@@ -234,11 +271,29 @@ fn secret_files(app: &AppHandle) -> R<Vec<PathBuf>> {
             }
         }
     }
-    let mcp = mcp_path(app)?;
-    if mcp.exists() {
-        out.push(mcp);
+    for p in [mcp_path(app)?, assistants_path(app)?] {
+        if p.exists() {
+            out.push(p);
+        }
     }
     Ok(out)
+}
+
+fn assistants_path(app: &AppHandle) -> R<PathBuf> {
+    Ok(data_dir(app)?.join("assistants.json"))
+}
+
+/// Assistants personnalisés (modèle, consignes, réglages) : tableau JSON géré par l'interface.
+pub fn load_assistants(app: &AppHandle) -> Vec<Value> {
+    assistants_path(app)
+        .ok()
+        .and_then(|p| read_secret(&p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_assistants(app: &AppHandle, list: &[Value]) -> R<()> {
+    write_secret_json(&assistants_path(app)?, &list)
 }
 
 /// Existe-t-il des fichiers déjà chiffrés ?
@@ -636,6 +691,13 @@ mod tests {
         assert_eq!(s.settings_version, SETTINGS_VERSION);
         assert_eq!(s.vocabulary(), ["Proxmox", "fail2ban", "ZFS"]);
         assert_eq!(s.base_url, "http://localhost:11434");
+        assert_eq!(s.active().url, "http://localhost:11434");
+
+        // Ancienne adresse unique reprise comme premier serveur.
+        let mut old: Settings = serde_json::from_str(r#"{"baseUrl":"http://192.168.1.20:11434","servers":[]}"#).unwrap();
+        migrate_settings(&mut old);
+        assert_eq!(old.servers.len(), 1);
+        assert_eq!(old.active(), Server { id: "default".into(), name: "Ollama".into(), url: "http://192.168.1.20:11434".into(), ..Default::default() });
         assert_eq!(s.num_ctx, 16384);
         assert!(Settings::default().encrypt_data);
     }

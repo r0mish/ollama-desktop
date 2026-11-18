@@ -4,6 +4,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   api,
   type ApiMessage,
+  type Assistant,
   type ConvParams,
   type Conversation,
   type ConversationSummary,
@@ -16,6 +17,8 @@ import {
   type ProjectContext,
   type Project,
   type Risk,
+  type RunningModel,
+  type Server,
   type ServerStatus,
   type Settings,
   type TextFile,
@@ -32,7 +35,9 @@ import { findProject, initProjectsUi, loadProjects, openProjectDialog, projectCh
 import { cancelDictation, initDictation, toggleDictation } from "./dictation";
 import { initModelsUi, openModelsDialog } from "./models-ui";
 import { initPopover } from "./popover";
-import { initModelPicker, renderModelButton } from "./model-picker";
+import { commitServerForm, initServersUi, renderServerChip, renderServers, serversDraft } from "./servers-ui";
+import { initModelPicker, openModelMenu, renderModelButton } from "./model-picker";
+import { assistants, initAssistantsUi, loadAssistants, openAssistantsDialog } from "./assistants-ui";
 import { initConvSettings, isCustomized } from "./conv-settings";
 import { initPalette, matches, openPalette, type PaletteItem } from "./palette";
 import type { Platform } from "./agent";
@@ -125,6 +130,8 @@ interface Draft {
   /** Consignes et réglages choisis avant le premier envoi (absent = réglages globaux). */
   systemPrompt?: string | null;
   params?: ConvParams;
+  /** Nom de l'assistant appliqué. */
+  assistant?: string;
 }
 
 const state = {
@@ -136,6 +143,7 @@ const state = {
   modelsLoaded: false,
   /** Modèles chargés en mémoire par Ollama (réponse immédiate). */
   loaded: [] as string[],
+  running: [] as RunningModel[],
   /** Dernier modèle choisi à la main, par mode : repris par les nouvelles conversations. */
   lastModel: {} as Partial<Record<Kind, string>>,
   convs: [] as ConversationSummary[],
@@ -239,6 +247,7 @@ const icons = {
   edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>',
+  compare: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="7.5" height="16" rx="2"/><rect x="13.5" y="4" width="7.5" height="16" rx="2"/></svg>',
   folder: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
   server: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>',
 };
@@ -268,20 +277,48 @@ function fillModelSelect(select: HTMLSelectElement, value: string, auto?: string
 }
 
 async function loadModels() {
-  state.server = await api.serverStatus().catch((e) => ({ url: state.settings.baseUrl, version: null, error: errMsg(e), insecure: false }));
+  const srv = state.settings.servers.find((v) => v.id === state.settings.activeServer) ?? state.settings.servers[0];
+  state.server = await api
+    .serverStatus()
+    .catch((e) => ({ id: srv?.id ?? "", name: srv?.name ?? "Ollama", url: srv?.url ?? "", tunnel: null, version: null, error: errMsg(e), insecure: false }));
   if (connected()) {
     try {
       state.models = await api.listModels();
       state.modelsLoaded = true;
-      state.loaded = (await api.runningModels().catch(() => [])).map((r) => r.name);
     } catch (e) {
       toast(`Liste des modèles indisponible : ${errMsg(e)}`, true);
     }
+    await refreshRunning();
+  } else {
+    state.running = [];
+    state.loaded = [];
   }
+  renderServerChip();
   if (!state.current && (!state.selectedModel || !modelInfo(state.selectedModel))) state.selectedModel = defaultModelFor(state.mode);
   renderModelButton();
   if (!state.current) renderWelcome();
   renderChrome();
+}
+
+/** Modèles chargés en mémoire sur le serveur (indicateur de la barre latérale). */
+async function refreshRunning() {
+  if (!connected()) return;
+  state.running = await api.runningModels().catch(() => state.running);
+  state.loaded = state.running.map((r) => r.name);
+  renderServerChip();
+}
+
+/** Change de serveur Ollama (ou de liste de serveurs) puis recharge son état et ses modèles. */
+async function applyServers(servers: Server[], activeServer: string) {
+  const next = { ...state.settings, servers, activeServer };
+  await api.saveSettings(next);
+  state.settings = next;
+  state.server = null;
+  state.models = [];
+  state.modelsLoaded = false;
+  renderServerChip();
+  if (!state.current) renderWelcome();
+  await loadModels();
 }
 
 const modelInfo = (id: string) => state.models.find((m) => m.id === id);
@@ -306,6 +343,28 @@ function defaultModelFor(kind: Kind): string {
   const loaded = pool.find((m) => state.loaded.includes(m.id));
   const hinted = kind === "code" ? pool.find((m) => CODE_HINT.test(m.id)) : undefined;
   return (loaded ?? hinted ?? pool[0])?.id ?? wanted;
+}
+
+/** Applique un assistant (modèle, consignes, réglages) à la conversation affichée ou au brouillon. */
+function useAssistant(a: Assistant) {
+  // Un second clic sur l'assistant déjà choisi (avant le premier envoi) le retire.
+  const off = !state.current && state.draft.assistant === a.name;
+  const patch = off
+    ? { assistant: undefined, systemPrompt: undefined, params: undefined }
+    : { assistant: a.name, systemPrompt: a.systemPrompt || undefined, params: a.params };
+  if (state.current) {
+    Object.assign(state.current, { ...patch, systemPrompt: patch.systemPrompt ?? null });
+    saveCurrent();
+  } else {
+    Object.assign(state.draft, patch);
+  }
+  if (!off && a.model) {
+    if (modelInfo(a.model)) state.selectedModel = a.model;
+    else toast(`Le modèle ${a.model} de cet assistant n'est pas installé sur ce serveur : modèle actuel conservé.`, true);
+  }
+  renderChrome();
+  if (!state.current) renderWelcome();
+  el.input.focus();
 }
 
 /** Choix explicite d'un modèle par l'utilisateur. */
@@ -610,6 +669,7 @@ const opts = () => {
     projectId: c ? c.projectId : state.draft.projectId,
     systemPrompt: c ? c.systemPrompt : state.draft.systemPrompt,
     params: c ? c.params : state.draft.params,
+    assistant: c ? c.assistant : state.draft.assistant,
   };
 };
 
@@ -846,14 +906,21 @@ function renderWelcome() {
   if (!connected()) {
     el.messages.innerHTML = onboardingHtml(
       1,
-      `<h2>Ollama est injoignable</h2>
+      `<h2>${escapeHtml(state.server.name)} est injoignable</h2>
       <p class="muted">${escapeHtml(state.server.error ?? "")}</p>
-      <ol class="setup-steps">
+      ${
+        state.server.tunnel
+          ? `<ol class="setup-steps">
+        <li>Vérifiez qu'Ollama tourne sur le serveur : <code>systemctl status ollama</code></li>
+        <li>Vérifiez la connexion SSH dans « Serveurs SSH… » (clé installée, empreinte validée).</li>
+      </ol>`
+          : `<ol class="setup-steps">
         <li>Installez Ollama : <a href="https://ollama.com/download" data-external>ollama.com/download</a> (Linux : <code>curl -fsSL https://ollama.com/install.sh | sh</code>, ou le paquet de votre distribution)</li>
         <li>Lancez le serveur : <code>ollama serve</code> (ou <code>systemctl start ollama</code>)</li>
-        <li>Serveur sur une autre machine ? Indiquez son adresse dans les réglages.</li>
-      </ol>
-      <p class="row center"><button class="btn-primary" data-retry-server>Réessayer</button><button class="btn-ghost" data-open-settings>Adresse du serveur…</button></p>
+        <li>Ollama sur une autre machine ? Ajoutez-la dans les réglages : adresse directe ou tunnel SSH.</li>
+      </ol>`
+      }
+      <p class="row center"><button class="btn-primary" data-retry-server>Réessayer</button><button class="btn-ghost" data-open-settings>Serveurs…</button></p>
       <p class="muted small">La connexion est retentée automatiquement toutes les 15 secondes.</p>`,
     );
     return;
@@ -916,9 +983,16 @@ function renderWelcome() {
   const hour = new Date().getHours();
   const greet = hour < 6 || hour >= 18 ? "Bonsoir" : "Bonjour";
   const p = findProject(state.draft.projectId);
+  const applied = state.draft.assistant;
+  const cards = `<div class="assistant-cards">${assistants()
+    .map(
+      (a) => `<button class="assistant-card${a.name === applied ? " on" : ""}" data-assistant="${escapeHtml(a.id)}" title="${escapeHtml(a.description || a.systemPrompt.slice(0, 200))}">
+        <strong>${escapeHtml(a.name)}</strong><small>${escapeHtml(a.description || a.model || "modèle par défaut")}</small></button>`,
+    )
+    .join("")}<button class="assistant-card add" data-new-assistant>＋ ${assistants().length ? "Nouvel assistant" : "Créer un assistant"}</button></div>`;
   el.messages.innerHTML = p
     ? `<div class="welcome"><h2>${escapeHtml(p.name)}</h2><p>Nouvelle conversation dans ce projet.</p>${projectBanner()}</div>`
-    : `<div class="welcome"><h2>${greet} 👋</h2><p>Comment puis-je vous aider ?</p></div>`;
+    : `<div class="welcome wide"><h2>${applied ? escapeHtml(applied) : `${greet} 👋`}</h2><p>${applied ? "Assistant sélectionné pour cette conversation." : "Comment puis-je vous aider ?"}</p>${cards}</div>`;
 }
 
 function instrHint(ws: string): string {
@@ -978,14 +1052,41 @@ function messageHtml(m: Message, next: Message | undefined): string {
     ? `<div class="msg-error">${escapeHtml(m.error)} <button class="btn-ghost sm" data-act="retry">Réessayer</button></div>`
     : "";
   const endOfTurn = !next || next.role === "user";
+  // Comparaison avec un autre modèle : dernière réponse d'un tour simple (sans appel d'outil).
+  const msgs = state.current?.messages ?? [];
+  const canCompare = !next && !m.toolCalls?.length && !m.alt && !!m.content && msgs[msgs.indexOf(m) - 1]?.role === "user" && state.models.length > 1;
   // Pendant l'exécution, le dernier message n'a pas encore d'actions (copier, régénérer…).
   const actions = streaming || !endOfTurn || (currentRun() && !next)
     ? ""
     : `<div class="msg-actions">
         <button class="icon-btn sm" data-act="copy" title="Copier">${icons.copy}</button>
         ${!next ? `<button class="icon-btn sm" data-act="retry" title="Régénérer">${icons.retry}</button>` : ""}
+        ${canCompare ? `<button class="icon-btn sm" data-act="compare" title="Comparer avec un autre modèle">${icons.compare}</button>` : ""}
         <span class="meta">${escapeHtml(meta)}</span>
       </div>`;
+  if (m.alt) {
+    // Deux réponses côte à côte : la réponse d'origine et celle du second modèle.
+    const a = m.alt;
+    const stat = (u: Message["usage"]) => (u ? [`${u.completionTokens} tokens`, fmtSpeed(u.tokensPerSec)].filter(Boolean).join(" · ") : "");
+    const altBody = a.error
+      ? `<div class="msg-error">${escapeHtml(a.error)}</div>`
+      : a.content
+        ? `<div class="md">${renderMarkdown(a.content)}</div>`
+        : a.reasoning
+          ? `<details class="reasoning" open><summary>Raisonnement</summary><div class="md">${renderMarkdown(a.reasoning)}</div></details>`
+          : '<span class="typing"><i></i><i></i><i></i></span>';
+    return `<div class="msg assistant has-alt" data-id="${m.id}">
+      <div class="compare">
+        <div class="cmp-col"><div class="cmp-head"><code>${escapeHtml(m.model ?? "")}</code><span>${escapeHtml(stat(m.usage))}</span></div>${body ? `<div class="md">${body}</div>` : ""}</div>
+        <div class="cmp-col"><div class="cmp-head"><code>${escapeHtml(a.model)}</code><span>${escapeHtml(stat(a.usage))}</span><span class="spacer"></span>${
+          currentRun()
+            ? ""
+            : `<button class="btn-ghost sm" data-act="keep-alt" title="Garder cette réponse à la place de l'autre">Garder</button>
+               <button class="icon-btn sm" data-act="drop-alt" title="Fermer la comparaison">×</button>`
+        }</div>${altBody}</div>
+      </div>
+    </div>`;
+  }
   return `<div class="msg assistant${streaming ? " streaming" : ""}" data-id="${m.id}">
     ${reasoning}${body ? `<div class="md">${body}</div>` : ""}${tools ? `<div class="tools">${tools}</div>` : ""}${error}${actions}
   </div>`;
@@ -1063,6 +1164,9 @@ el.messages.addEventListener("click", async (ev) => {
   const t = ev.target as HTMLElement;
   if (t.closest("[data-open-settings]")) return openSettings();
   if (t.closest("[data-open-models]")) return openModelsDialog();
+  if (t.closest("[data-new-assistant]")) return openAssistantsDialog(null);
+  const card = assistants().find((a) => a.id === t.closest<HTMLElement>("[data-assistant]")?.dataset.assistant);
+  if (card) return useAssistant(card);
   const starter = t.closest<HTMLElement>("[data-pull-model]");
   if (starter) return openModelsDialog(starter.dataset.pullModel);
   if (t.closest("[data-finish-onboarding]")) {
@@ -1114,6 +1218,22 @@ el.messages.addEventListener("click", async (ev) => {
       return regenerate(msg);
     case "edit":
       return editMessage(msg, msgEl);
+    case "compare":
+      return openModelMenu(actBtn, {
+        selected: "",
+        exclude: [msg.model ?? ""],
+        title: "Comparer avec…",
+        pick: (model) => compare(msg, model),
+      });
+    case "keep-alt":
+    case "drop-alt":
+      // « Garder » : la réponse du second modèle remplace celle d'origine.
+      if (actBtn.dataset.act === "keep-alt" && msg.alt && !msg.alt.error) {
+        Object.assign(msg, { content: msg.alt.content, model: msg.alt.model, usage: msg.alt.usage, reasoning: msg.alt.reasoning });
+      }
+      delete msg.alt;
+      rerenderMessage(msg, true);
+      return saveCurrent();
   }
 });
 
@@ -1154,6 +1274,66 @@ function editMessage(msg: Message, node: HTMLElement) {
       await runAgent();
     }
   });
+}
+
+/** Envoie la même question à un second modèle et affiche les deux réponses côte à côte. */
+async function compare(msg: Message, model: string) {
+  const conv = state.current;
+  if (!conv || state.runs.has(conv.id)) return;
+  const idx = conv.messages.indexOf(msg);
+  if (idx < 0) return;
+  const now = Date.now();
+  const run = startRun(conv, { phase: "Comparaison…", detail: model, since: now, runStart: now, step: 0, maxSteps: 0 });
+  const alt = (msg.alt = { model, content: "" } as NonNullable<Message["alt"]>);
+  run.requestId = uid();
+  updateComposerState();
+  renderSidebar();
+  rerenderMessage(msg, true);
+  try {
+    // Même historique jusqu'à la question, sans outils : seules les réponses sont comparées.
+    const messages = toApiMessages({ ...conv, messages: conv.messages.slice(0, idx) }, sysPrompt(conv));
+    await api.chat(
+      run.requestId,
+      {
+        model,
+        messages,
+        temperature: conv.params?.temperature ?? state.settings.temperature,
+        maxTokens: state.settings.maxTokens,
+        tools: [],
+        ...chatOptions({ model, params: conv.params }),
+      },
+      (ev) => {
+        if (ev.type === "delta") {
+          alt.content += ev.text;
+          setActivity(run, "Comparaison : rédaction…", model);
+        } else if (ev.type === "reasoning") {
+          alt.reasoning = (alt.reasoning ?? "") + ev.text;
+          setActivity(run, "Comparaison : réflexion…", model);
+        } else if (ev.type === "usage") {
+          alt.usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, tokensPerSec: ev.tokensPerSec };
+          recordUsage(conv, model, ev.promptTokens, ev.completionTokens, true);
+        } else if (ev.type === "retry") {
+          setActivity(run, "Nouvel essai dans", ev.reason, { until: Date.now() + ev.delaySecs * 1000 });
+        } else if (ev.type === "done" && ev.cancelled && !alt.content) {
+          alt.error = "Comparaison interrompue.";
+        }
+        rerenderMessage(msg);
+      },
+    );
+    if (!alt.content && !alt.error) alt.error = "Réponse vide du modèle.";
+  } catch (e) {
+    alt.error = errMsg(e);
+  } finally {
+    endRun(run);
+    if (viewing(conv)) {
+      rerenderMessage(msg, true);
+      updateComposerState();
+      renderActivity();
+      renderUsage();
+    }
+    renderSidebar();
+    await save(conv);
+  }
 }
 
 async function regenerate(msg: Message) {
@@ -1227,6 +1407,7 @@ async function send() {
       updatedAt: now,
       systemPrompt: o.systemPrompt ?? (state.settings.systemPrompt || null),
       ...(o.params ? { params: o.params } : {}),
+      ...(o.assistant ? { assistant: o.assistant } : {}),
       messages: [],
       workspace: o.workspace,
       permissionMode: o.permissionMode,
@@ -1897,16 +2078,12 @@ window.addEventListener("drop", (e) => {
 // ---------------------------------------------------------------- réglages
 
 const s = {
-  apiKey: $<HTMLInputElement>("#api-key"),
-  keyStatus: $("#key-status"),
   model: $<HTMLSelectElement>("#s-model"),
   system: $<HTMLTextAreaElement>("#s-system"),
   temp: $<HTMLInputElement>("#s-temp"),
   max: $<HTMLInputElement>("#s-max"),
   theme: $<HTMLSelectElement>("#s-theme"),
   enter: $<HTMLInputElement>("#s-enter"),
-  base: $<HTMLInputElement>("#s-base"),
-  serverStatus: $("#server-status"),
   ctx: $<HTMLSelectElement>("#s-ctx"),
   keep: $<HTMLInputElement>("#s-keep"),
   thinking: $<HTMLInputElement>("#s-thinking"),
@@ -2059,44 +2236,6 @@ const MCP_EXAMPLE = `{
 }
 `;
 
-async function refreshKeyStatus() {
-  const st = await api.keyStatus().catch(() => ({ configured: false, source: null }));
-  s.keyStatus.textContent = !st.configured
-    ? "Aucune clé : inutile pour un serveur Ollama classique."
-    : st.source === "keyring"
-      ? "✓ Clé enregistrée dans le trousseau du système."
-      : "✓ Clé lue depuis la variable d'environnement OLLAMA_API_KEY.";
-}
-
-function renderServerStatus(st: ServerStatus | null) {
-  s.serverStatus.className = st?.error ? "small error" : "muted small";
-  s.serverStatus.textContent = !st
-    ? ""
-    : st.version
-      ? `✓ Connecté à Ollama ${st.version} · ${state.models.length} modèle${state.models.length > 1 ? "s" : ""} installé${state.models.length > 1 ? "s" : ""}` +
-        (st.insecure ? " · ⚠ HTTP en clair hors de cette machine : réservez-le à un réseau de confiance (ou passez par un proxy HTTPS / VPN)." : "")
-      : `✗ ${st.error ?? "injoignable"}`;
-}
-
-$("#test-server").addEventListener("click", async () => {
-  const url = s.base.value.trim() || "http://localhost:11434";
-  s.serverStatus.className = "muted small";
-  s.serverStatus.textContent = "Test en cours…";
-  try {
-    // Le test porte sur l'URL saisie : enregistrée d'abord (validée côté Rust).
-    if (url !== state.settings.baseUrl) {
-      state.settings = { ...state.settings, baseUrl: url };
-      await api.saveSettings(state.settings);
-    }
-    await loadModels();
-    renderServerStatus(state.server);
-    fillModelSelect(s.model, s.model.value, "Automatique (premier modèle installé)");
-    fillModelSelect(s.codeModel, s.codeModel.value, "Automatique (premier modèle gérant les outils)");
-  } catch (e) {
-    renderServerStatus({ url, version: null, error: errMsg(e), insecure: false });
-  }
-});
-
 function showTab(tab: string) {
   document.querySelectorAll<HTMLElement>(".settings-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll<HTMLElement>("#settings .tab").forEach((t) => (t.hidden = t.dataset.tab !== tab));
@@ -2227,11 +2366,9 @@ s.vaultKeyAction.addEventListener("click", async () => {
 
 async function openSettings(tab = "general") {
   const st = state.settings;
-  await refreshKeyStatus();
-  s.apiKey.value = "";
+  renderServers();
   fillModelSelect(s.model, st.defaultModel, "Automatique (premier modèle installé)");
   fillModelSelect(s.codeModel, st.codeModel, "Automatique (premier modèle gérant les outils)");
-  renderServerStatus(state.server);
   s.ctx.value = String(st.numCtx ?? 16384);
   if (s.ctx.value !== String(st.numCtx)) {
     s.ctx.insertAdjacentHTML("beforeend", `<option value="${st.numCtx}">${fmtTokens(st.numCtx)}</option>`);
@@ -2244,7 +2381,6 @@ async function openSettings(tab = "general") {
   s.max.value = st.maxTokens?.toString() ?? "";
   s.theme.value = st.theme;
   s.enter.checked = st.sendOnEnter;
-  s.base.value = st.baseUrl;
   s.searx.value = st.searxngUrl;
   s.webDefault.checked = st.webSearchDefault;
   s.timeout.value = String(st.commandTimeout);
@@ -2274,27 +2410,6 @@ async function openSettings(tab = "general") {
   pollMcp();
 }
 
-$("#save-key").addEventListener("click", async () => {
-  try {
-    await api.setKey(s.apiKey.value);
-    s.apiKey.value = "";
-    await refreshKeyStatus();
-    await loadModels();
-    renderServerStatus(state.server);
-    toast("Clé API enregistrée");
-  } catch (e) {
-    s.error.textContent = errMsg(e);
-    s.error.hidden = false;
-  }
-});
-
-$("#delete-key").addEventListener("click", async () => {
-  await api.deleteKey().catch((e) => toast(errMsg(e), true));
-  await refreshKeyStatus();
-  await loadModels();
-  renderServerStatus(state.server);
-});
-
 $("#settings-cancel").addEventListener("click", () => el.settings.close());
 s.theme.addEventListener("change", () => applyTheme(s.theme.value as Settings["theme"]));
 el.settings.addEventListener("close", () => applyTheme(state.settings.theme));
@@ -2302,9 +2417,10 @@ el.settings.addEventListener("close", () => applyTheme(state.settings.theme));
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const num = (v: string) => (v.trim() === "" ? null : Number(v));
+  if (!commitServerForm()) return showTab("general");
   const next: Settings = {
     ...state.settings,
-    baseUrl: s.base.value.trim() || "http://localhost:11434",
+    ...serversDraft(),
     defaultModel: s.model.value,
     systemPrompt: s.system.value,
     temperature: num(s.temp.value),
@@ -2340,7 +2456,8 @@ $("#settings-form").addEventListener("submit", async (e) => {
     return showTab("tools");
   }
   try {
-    const baseChanged = next.baseUrl !== state.settings.baseUrl;
+    const serverKey = (x: Settings) => JSON.stringify([x.servers, x.activeServer]);
+    const baseChanged = serverKey(next) !== serverKey(state.settings);
     await api.saveSettings(next);
     if (next.encryptData !== state.settings.encryptData || next.encryptData) {
       const v = await api.vaultStatus().catch(() => null);
@@ -2356,7 +2473,13 @@ $("#settings-form").addEventListener("submit", async (e) => {
       state.draft.webSearch = next.webSearchDefault;
     }
     el.settings.close();
-    if (baseChanged) await loadModels();
+    if (baseChanged) {
+      state.server = null;
+      state.models = [];
+      state.modelsLoaded = false;
+      await loadModels();
+    }
+    renderServerChip();
     renderChrome();
     if (!state.current) renderWelcome();
   } catch (err) {
@@ -2437,6 +2560,7 @@ function paletteItems(q: string): PaletteItem[] {
     { group: "Actions", label: "Réglages", hint: "Ctrl+,", keywords: "préférences configuration serveur", run: () => openSettings() },
     { group: "Actions", label: "Serveurs SSH…", keywords: "distant remote connexion clé", run: () => openSshDialog() },
     { group: "Actions", label: "Nouveau projet…", keywords: "consignes fichiers", run: () => newProject() },
+    { group: "Actions", label: "Assistants…", keywords: "persona rôle consignes préréglage", run: () => openAssistantsDialog() },
     { group: "Actions", label: "Afficher ou masquer la barre latérale", hint: "Ctrl+B", run: () => el.app.classList.toggle("sidebar-hidden") },
     { group: "Actions", label: "Thème clair", keywords: "apparence light", run: () => setTheme("light") },
     { group: "Actions", label: "Thème sombre", keywords: "apparence dark nuit", run: () => setTheme("dark") },
@@ -2460,6 +2584,12 @@ function paletteItems(q: string): PaletteItem[] {
       hint: [c.kind === "code" ? "Code" : "", state.runs.has(c.id) ? "en cours" : dayBucket(c.updatedAt)].filter(Boolean).join(" · "),
       run: () => openConversation(c.id),
     });
+  }
+  for (const v of state.settings.servers.filter((v) => v.id !== state.settings.activeServer && matches(q, `serveur ${v.name}`))) {
+    if (q) items.push({ group: "Serveurs", label: `Serveur : ${v.name}`, hint: "basculer", run: () => applyServers(state.settings.servers, v.id).catch((e) => toast(errMsg(e), true)) });
+  }
+  for (const a of assistants().filter((a) => matches(q, `assistant ${a.name} ${a.description}`))) {
+    if (q) items.push({ group: "Assistants", label: a.name, hint: a.model || "modèle par défaut", run: () => useAssistant(a) });
   }
   if (q) {
     for (const m of state.models.filter((m) => matches(q, m.id)).slice(0, 6)) {
@@ -2520,6 +2650,19 @@ async function init() {
     kind: () => opts().kind,
     pick: pickModel,
     manage: () => openModelsDialog(),
+    assistants,
+    pickAssistant: useAssistant,
+    manageAssistants: () => openAssistantsDialog(),
+    assistant: () => opts().assistant,
+  });
+  await loadAssistants();
+  initAssistantsUi({
+    toast,
+    models: () => state.models,
+    changed: () => {
+      if (!state.current) renderWelcome();
+    },
+    use: useAssistant,
   });
   initConvSettings({
     button: el.convSettingsBtn,
@@ -2537,6 +2680,25 @@ async function init() {
     },
   });
   initPalette({ items: paletteItems, search: paletteSearch });
+  initServersUi({
+    toast,
+    settings: () => state.settings,
+    status: () => state.server,
+    running: () => state.running,
+    modelCount: () => state.models.length,
+    apply: async (servers, active) => {
+      await applyServers(servers, active);
+      // Réglages ouverts : les listes de modèles suivent le serveur testé.
+      if (el.settings.open) {
+        fillModelSelect(s.model, s.model.value, "Automatique (premier modèle installé)");
+        fillModelSelect(s.codeModel, s.codeModel.value, "Automatique (premier modèle gérant les outils)");
+      }
+    },
+    openSettings: () => openSettings(),
+    openModels: () => openModelsDialog(),
+    openSsh: () => openSshDialog(),
+    refreshRunning,
+  });
   initModelsUi({
     toast,
     models: () => state.models,
@@ -2567,7 +2729,9 @@ async function init() {
   await loadModels();
   // Ollama lancé après l'application : nouvelle tentative régulière tant qu'il est injoignable.
   window.setInterval(() => {
-    if (!connected() && !state.runs.size && !document.hidden) loadModels();
+    if (document.hidden) return;
+    if (!connected() && !state.runs.size) loadModels();
+    else refreshRunning();
   }, 15000);
   renderUsage();
   updaterSupported = await api.updaterSupported().catch(() => false);
